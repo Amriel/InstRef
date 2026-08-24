@@ -1,0 +1,33 @@
+# --- runtime state, never committed -----------------------------------------
+config.json
+session.json
+device.json
+state.db
+state.db-wal
+state.db-shm
+last_run.json
+taxonomy.json
+logs/
+downloads/
+_archive/
+_update.zip
+
+# --- build ------------------------------------------------------------------
+build/
+dist/
+*.spec.bak
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# local scratch
+_to_delete/

@@ -1,0 +1,17 @@
+# Normalise line endings in the repo, restore them on checkout.
+#
+# Windows batch files MUST have CRLF or cmd.exe refuses to run them — this
+# bit us repeatedly when files travelled through Linux tooling. Declaring it
+# here means git guarantees it on every clone, instead of us remembering.
+* text=auto eol=lf
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.iss   text eol=crlf
+
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.mp4   binary
+*.db    binary

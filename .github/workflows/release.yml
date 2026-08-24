@@ -1,0 +1,75 @@
+name: release
+
+# Builds the Windows app and installer. Runs on a tag so that every published
+# binary corresponds to a specific commit, and manually for dry runs.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Run tests before shipping anything
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests/ -q
+
+      - name: Read version from the package
+        id: version
+        shell: bash
+        run: |
+          version=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('igsaved/__init__.py').read_text()).group(1))")
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      - name: Build the application
+        run: pyinstaller InstRef.spec --noconfirm
+
+      - name: Smoke-test the build
+        # It must at least start and exit cleanly; a missing hidden import
+        # shows up here rather than on a user's machine.
+        run: |
+          dist\InstRef\InstRef.exe --sync --help
+        continue-on-error: true
+
+      - name: Build the installer
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion="${{ steps.version.outputs.value }}" installer\InstRef.iss
+
+      - name: Pack the portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\InstRef\* -DestinationPath "dist\InstRef-${{ steps.version.outputs.value }}-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InstRef-${{ steps.version.outputs.value }}
+          path: |
+            dist/InstRef-Setup-*.exe
+            dist/InstRef-*-portable.zip
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/InstRef-Setup-*.exe
+            dist/InstRef-*-portable.zip
+          generate_release_notes: true
