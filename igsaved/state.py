@@ -645,6 +645,31 @@ class State:
             )
             self.db.commit()
 
+    def last_finished_at(self) -> Optional[datetime]:
+        """Коли завершився попередній прохід. Потрібно, щоб не бити API частіше,
+        ніж дозволено: саме серії проходів з різницею у хвилини Instagram
+        сприймає як автоматизацію."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT finished_at FROM runs WHERE finished_at IS NOT NULL"
+                " ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row or not row["finished_at"]:
+            return None
+        try:
+            return datetime.fromisoformat(str(row["finished_at"]))
+        except ValueError:
+            return None
+
+    def hours_since_last_run(self) -> Optional[float]:
+        last = self.last_finished_at()
+        if last is None:
+            return None
+        now = datetime.now(timezone.utc)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - last).total_seconds() / 3600.0)
+
     def last_runs(self, limit: int = 10) -> list[sqlite3.Row]:
         with self._lock:
             return self.db.execute(

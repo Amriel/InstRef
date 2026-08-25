@@ -13,6 +13,11 @@ from .config import ALL_POSTS_NAME, ALL_POSTS_PK, LIKED_NAME, LIKED_PK
 Logger = Callable[[str], None]
 
 
+def _short(exc: Exception, limit: int = 80) -> str:
+    text = str(exc).strip().replace("\n", " ") or exc.__class__.__name__
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 @dataclass
 class CollectionInfo:
     pk: str
@@ -79,10 +84,22 @@ class IGClient:
         return self._client
 
     def connect(self, sessionid: str) -> str:
-        """Логін за cookie sessionid. Повертає ім'я користувача."""
+        """Підключення за cookie sessionid. Повертає ім'я користувача.
+
+        Спершу пробуємо відновлену сесію з device.json. `login_by_sessionid`
+        робить кілька запитів і виглядає як свіжий вхід; десяток таких входів
+        на добу — найпомітніший слід автоматизації, і саме за нього приходить
+        попередження від Instagram. Якщо збережена сесія жива, вистачає одного
+        дешевого запиту замість повного входу.
+        """
         sessionid = (sessionid or "").strip()
         if not sessionid:
             raise InstagramError("Порожній sessionid — спершу підключи сесію на вкладці «Сесія».")
+
+        reused = self._reuse_session(sessionid)
+        if reused:
+            return reused
+
         try:
             ok = self.client.login_by_sessionid(sessionid)
         except Exception as exc:  # noqa: BLE001
@@ -95,6 +112,27 @@ class IGClient:
             self.username = self.client.username or "?"
         self._persist_device()
         self.log(f"Підключено як @{self.username}")
+        return self.username
+
+    def _reuse_session(self, sessionid: str) -> Optional[str]:
+        """Пробує обійтись збереженою сесією. None — треба повний вхід."""
+        try:
+            settings = self.client.get_settings() or {}
+        except Exception:  # noqa: BLE001
+            return None
+        saved = str((settings.get("cookies") or {}).get("sessionid") or "")
+        if not saved or saved.split("%3A")[0] != sessionid.split("%3A")[0]:
+            # Інший акаунт або порожній профіль — тільки повний вхід.
+            return None
+        if not settings.get("authorization_data"):
+            return None
+        try:
+            info = self.client.account_info()
+        except Exception as exc:  # noqa: BLE001 — сесія протухла, це не помилка
+            self.log(f"Збережена сесія не підійшла ({_short(exc)}) — входжу заново.")
+            return None
+        self.username = getattr(info, "username", None) or self.client.username or "?"
+        self.log(f"Сесію відновлено з профілю — вхід не потрібен. @{self.username}")
         return self.username
 
     def _persist_device(self) -> None:

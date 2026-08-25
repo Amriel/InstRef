@@ -546,7 +546,26 @@ class MainWindow(QMainWindow):
         delays.addStretch(1)
         form.addRow(_flabel("Пауза між сторінками"), _row(delays))
         form.addRow(_flabel(""), _hint(
-            "Головний захист від блокування акаунта — знижувати без потреби не варто."))
+            "Головний захист акаунта. Instagram позначає як автоматизацію не обсяг, "
+            "а темп: рівні короткі інтервали виглядають як скрипт, бо людина так "
+            "не гортає. Знижувати без потреби не варто."))
+
+        self.sp_cooldown = QDoubleSpinBox()
+        self.sp_cooldown.setRange(0.0, 168.0)
+        self.sp_cooldown.setSingleStep(1.0)
+        self.sp_cooldown.setDecimals(1)
+        self.sp_cooldown.setSuffix(" год")
+        self.sp_cooldown.setSpecialValueText("без обмеження")
+        self.sp_cooldown.setFixedWidth(150)
+        self.sp_cooldown.setToolTip(
+            "Скільки має минути від попереднього проходу, щоб дозволити наступний.\n"
+            "Запуск за розкладом просто пропускається; ручний — питає підтвердження."
+        )
+        form.addRow(_flabel("Мінімум між проходами"), _row(_left(self.sp_cooldown)))
+        form.addRow(_flabel(""), _hint(
+            "Кожен прохід — це вхід і десятки запитів. Кілька проходів поспіль із "
+            "різницею у хвилини — найпомітніший слід автоматизації, і саме за нього "
+            "приходить попередження від Instagram."))
         return page
 
     # -------------------------------------------------- розділ «Пролайкане»
@@ -1076,6 +1095,7 @@ class MainWindow(QMainWindow):
         self.sp_limit.setValue(cfg.max_items_per_run)
         self.sp_delay_min.setValue(cfg.page_delay_min)
         self.sp_delay_max.setValue(cfg.page_delay_max)
+        self.sp_cooldown.setValue(cfg.min_hours_between_runs)
         self.sp_timeout.setValue(cfg.request_timeout)
         self.sp_retries.setValue(cfg.max_retries)
         self.ed_proxy.setText(cfg.proxy)
@@ -1161,6 +1181,7 @@ class MainWindow(QMainWindow):
         cfg.max_items_per_run = self.sp_limit.value()
         cfg.page_delay_min = self.sp_delay_min.value()
         cfg.page_delay_max = max(self.sp_delay_max.value(), self.sp_delay_min.value())
+        cfg.min_hours_between_runs = self.sp_cooldown.value()
         cfg.request_timeout = self.sp_timeout.value()
         cfg.max_retries = self.sp_retries.value()
         cfg.proxy = self.ed_proxy.text().strip()
@@ -1958,6 +1979,10 @@ class MainWindow(QMainWindow):
         self._collect_ui_into_config()
         self.cfg.save()
 
+        force = self._confirm_cooldown()
+        if force is None:
+            return
+
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_refresh.setEnabled(False)
@@ -1965,11 +1990,41 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("Працюю…")
         self._log("═══ Старт синхронізації ═══")
 
-        self.sync_worker = SyncWorker(self.cfg, self.state, self.sessionid, selected, self)
+        self.sync_worker = SyncWorker(
+            self.cfg, self.state, self.sessionid, selected, force, self)
         self.sync_worker.line.connect(self._log)
         self.sync_worker.progress.connect(self._on_progress)
         self.sync_worker.done.connect(self._on_sync_done)
         self.sync_worker.start()
+
+    def _confirm_cooldown(self):
+        """None — не запускати; True — запустити попри запобіжник; False — звичайно.
+
+        Ручний запуск не забороняємо: людина має право. Але показуємо, чим це
+        загрожує, бо саме серії проходів за кілька хвилин Instagram позначає як
+        автоматизацію — і за це вже приходило попередження.
+        """
+        limit = float(self.cfg.min_hours_between_runs or 0)
+        if limit <= 0:
+            return False
+        passed = self.state.hours_since_last_run()
+        if passed is None or passed >= limit:
+            return False
+
+        minutes = int(round((limit - passed) * 60))
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"Попередній прохід був {int(round(passed * 60))} хв тому.\n"
+            f"За наявним обмеженням наступний — через {minutes} хв.\n\n"
+            "Часті звернення до Instagram виглядають як автоматизація й ведуть "
+            "до попереджень і обмежень акаунта.\n\nСинхронізувати все одно?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self._log(f"Синхронізацію відкладено: наступний прохід через {minutes} хв.")
+            return None
+        self._log("Запобіжник частоти обійдено вручну.")
+        return True
 
     def on_stop(self) -> None:
         if self.sync_worker:

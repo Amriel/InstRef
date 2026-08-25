@@ -86,6 +86,9 @@ LEGACY_TEMPLATES = {"{date}_{user}_{code}"}
 LEGACY_TASK_NAME = "IG Saved Sync"
 # Типовий таймаут моделі до того, як вона стала дивитись кілька кадрів.
 LEGACY_VISION_TIMEOUT = 60
+# Паузи, що були типовими до попередження Instagram про автоматизацію.
+LEGACY_DELAYS = (2.0, 5.0)
+LEGACY_DOWNLOAD_DELAY = 0.4
 TEMPLATE_TOKENS = {
     "{title}": "початок підпису без хештегів і емодзі (якщо тексту нема — код поста)",
     "{user}": "автор без @",
@@ -127,11 +130,18 @@ class Config:
     scan_limit: int = 0
     stop_after_known: int = 40  # стоп після N поспіль уже завантажених
     max_items_per_run: int = 0  # 0 = без ліміту
-    page_delay_min: float = 2.0
-    page_delay_max: float = 5.0
-    download_delay: float = 0.4
+    # Паузи між сторінками — головний захист акаунта. Instagram позначає як
+    # автоматизацію не обсяг, а темп: рівні короткі інтервали виглядають як
+    # скрипт, бо людина так не гортає.
+    page_delay_min: float = 8.0
+    page_delay_max: float = 15.0
+    download_delay: float = 1.0
     request_timeout: int = 60
     max_retries: int = 3
+    # Мінімум годин між проходами. Кожен прохід — це логін і десятки запитів;
+    # кілька проходів поспіль з різницею у хвилини — найпомітніший слід
+    # автоматизації. 0 = без обмеження (не радимо).
+    min_hours_between_runs: float = 6.0
     proxy: str = ""  # напр. http://user:pass@host:port
 
     # --- Eagle ---
@@ -241,6 +251,12 @@ class Config:
         # мовчки, а свою назву користувача не чіпаємо.
         if self.schedule_task_name == LEGACY_TASK_NAME:
             self.schedule_task_name = "InstRef Sync"
+        # Старі паузи виявились надто жвавими — Instagram надіслав попередження
+        # про автоматизацію. Хто їх не чіпав, отримує спокійніші.
+        if (self.page_delay_min, self.page_delay_max) == LEGACY_DELAYS:
+            self.page_delay_min, self.page_delay_max = 8.0, 15.0
+        if abs(float(self.download_delay) - LEGACY_DOWNLOAD_DELAY) < 1e-9:
+            self.download_delay = 1.0
 
     def save(self, path: Path | None = None) -> None:
         path = path or CONFIG_PATH

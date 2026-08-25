@@ -199,12 +199,14 @@ class SyncWorker(QThread):
     done = Signal(object)  # Stats
 
     def __init__(self, cfg: Config, state: State, sessionid: str,
-                 collections: Optional[List[str]] = None, parent=None):
+                 collections: Optional[List[str]] = None, force: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.state = state
         self.sessionid = sessionid
         self.collections = collections
+        self.force = force
         self._stop = False
 
     def stop(self) -> None:
@@ -219,5 +221,5 @@ class SyncWorker(QThread):
             progress=lambda msg, cur, total: self.progress.emit(msg, cur, total),
             should_stop=lambda: self._stop,
         )
-        stats: Stats = engine.run(only_collections=self.collections)
+        stats: Stats = engine.run(only_collections=self.collections, force=self.force)
         self.done.emit(stats)

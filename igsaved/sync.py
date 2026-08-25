@@ -113,7 +113,33 @@ class SyncEngine:
         self._eagle_queue: List[tuple] = []  # (folder_id, EagleItem, media_pk, collection_pk)
 
     # ================================================================== запуск
-    def run(self, only_collections: Optional[List[str]] = None) -> Stats:
+    def cooldown_left(self) -> float:
+        """Скільки годин лишилось до дозволеного наступного проходу."""
+        limit = float(self.cfg.min_hours_between_runs or 0)
+        if limit <= 0:
+            return 0.0
+        passed = self.state.hours_since_last_run()
+        if passed is None:
+            return 0.0
+        return max(0.0, limit - passed)
+
+    def run(self, only_collections: Optional[List[str]] = None,
+            force: bool = False) -> Stats:
+        left = 0.0 if force else self.cooldown_left()
+        if left > 0:
+            # Свідомо гучно: тиха відмова тут виглядала б як «нічого не знайшлось».
+            minutes = int(round(left * 60))
+            self.log(
+                f"Пропускаю прохід: попередній був щойно. Наступний можна через "
+                f"{minutes} хв ({self.cfg.min_hours_between_runs:g} год між проходами)."
+            )
+            self.log(
+                "  Часті звернення — головна причина, чому Instagram позначає "
+                "застосунок як автоматизацію. Змінити межу: Налаштування → Сканування."
+            )
+            self.stats.errors.append("cooldown")
+            return self.stats
+
         run_id = self.state.start_run()
         note = ""
         try:

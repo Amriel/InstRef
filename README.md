@@ -166,5 +166,12 @@ updates can improve defaults without discarding your edits.
 [piexif](https://piexif.readthedocs.io/)
 
 InstRef uses Instagram's private mobile API through `instagrapi`. That is what
-makes reading your own saves possible at all, and it also means Instagram could
-change it at any time. Keep the request delays reasonable.
+makes reading your own saves possible at all — and it also means Instagram can
+see it as automation, because that is what it is.
+
+Instagram flags **pace**, not volume: short even intervals and repeated logins
+look like a script. InstRef defends the account by asking less often, not by
+hiding — it refuses to run twice within `min_hours_between_runs` (6 by default),
+reuses a stored session instead of logging in fresh each time, and waits 8–15
+seconds between pages. Lower those at your own risk, and expect a warning from
+Instagram if you sync many times an hour.

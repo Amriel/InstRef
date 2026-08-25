@@ -3021,3 +3021,141 @@ def test_review_queue_is_one_list_with_origin_marks(tmp_path):
         assert state.review_count() == 3
     finally:
         state.close()
+
+
+# ==========================================================================
+#  Запобіжник частоти: Instagram надіслав попередження про автоматизацію
+# ==========================================================================
+def test_engine_skips_a_run_that_comes_too_soon(tmp_path, monkeypatch):
+    """15 проходів за дві доби, деякі з різницею у 2 хвилини — саме той
+    візерунок, за який приходить попередження. Тепер він неможливий."""
+    engine, cfg, state = _engine(tmp_path, min_hours_between_runs=6.0)
+    try:
+        lines = []
+        engine.log = lines.append
+        connected = []
+        monkeypatch.setattr(engine.ig, "connect", lambda sid: connected.append(sid))
+
+        # перший прохід дозволено: попередніх немає
+        assert engine.cooldown_left() == 0.0
+
+        run_id = state.start_run()
+        state.finish_run(run_id, 10, 1, 0, 0, "")
+        assert engine.cooldown_left() > 5.9
+
+        stats = engine.run()
+        assert connected == []                     # до Instagram навіть не постукали
+        assert "cooldown" in stats.errors
+        assert any("Пропускаю прохід" in line for line in lines)
+        assert any("автоматизацію" in line for line in lines)   # сказано чому
+    finally:
+        state.close()
+
+
+def test_manual_run_can_override_the_cooldown(tmp_path, monkeypatch):
+    """Людина має право наполягти — але свідомо, а не випадково."""
+    engine, cfg, state = _engine(tmp_path, min_hours_between_runs=6.0)
+    try:
+        run_id = state.start_run()
+        state.finish_run(run_id, 10, 1, 0, 0, "")
+
+        monkeypatch.setattr(engine.ig, "connect", lambda sid: "user")
+        monkeypatch.setattr(engine, "_pick_collections", lambda only: [])
+        stats = engine.run(force=True)
+        assert "cooldown" not in stats.errors
+    finally:
+        state.close()
+
+
+def test_cooldown_can_be_switched_off(tmp_path):
+    engine, cfg, state = _engine(tmp_path, min_hours_between_runs=0)
+    try:
+        run_id = state.start_run()
+        state.finish_run(run_id, 10, 1, 0, 0, "")
+        assert engine.cooldown_left() == 0.0
+    finally:
+        state.close()
+
+
+def test_state_measures_time_since_the_last_run(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    state = State(tmp_path / "s.db")
+    try:
+        assert state.hours_since_last_run() is None      # проходів ще не було
+
+        run_id = state.start_run()
+        state.finish_run(run_id, 1, 0, 0, 0, "")
+        assert 0 <= state.hours_since_last_run() < 0.1
+
+        # незавершений прохід не рахується — інакше падіння блокувало б наступний
+        long_ago = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat(timespec="seconds")
+        state.db.execute("UPDATE runs SET finished_at = ?", (long_ago,))
+        state.db.commit()
+        state.start_run()
+        assert state.hours_since_last_run() > 9
+    finally:
+        state.close()
+
+
+def test_delays_are_raised_for_configs_that_never_touched_them(tmp_path):
+    """Старі 2–5 с виявились надто жвавими; хто їх не міняв — отримує спокійніші."""
+    path = tmp_path / "c.json"
+    path.write_text('{"page_delay_min": 2.0, "page_delay_max": 5.0, "download_delay": 0.4}',
+                    encoding="utf-8")
+    cfg = Config.load(path)
+    assert (cfg.page_delay_min, cfg.page_delay_max) == (8.0, 15.0)
+    assert cfg.download_delay == 1.0
+
+    # свідомо виставлені значення не чіпаємо
+    path.write_text('{"page_delay_min": 3.0, "page_delay_max": 7.0, "download_delay": 0.9}',
+                    encoding="utf-8")
+    cfg = Config.load(path)
+    assert (cfg.page_delay_min, cfg.page_delay_max, cfg.download_delay) == (3.0, 7.0, 0.9)
+
+
+def test_saved_session_is_reused_instead_of_logging_in_again(tmp_path):
+    """Повторний вхід — найпомітніший слід автоматизації. Живу сесію не чіпаємо."""
+    import types as _types
+
+    from igsaved.instagram import IGClient
+
+    client = IGClient(log=lambda _m: None)
+    logins = []
+
+    fake = _types.SimpleNamespace(
+        get_settings=lambda: {
+            "cookies": {"sessionid": "12345%3AoldTOKEN"},
+            "authorization_data": {"ds_user_id": "12345"},
+        },
+        account_info=lambda: _types.SimpleNamespace(username="amriel"),
+        login_by_sessionid=lambda sid: logins.append(sid) or True,
+        username="amriel",
+    )
+    client._client = fake
+
+    assert client.connect("12345%3AnewTOKEN") == "amriel"
+    assert logins == []                       # входу не було
+
+
+def test_full_login_still_happens_for_a_different_account(tmp_path):
+    import types as _types
+
+    from igsaved.instagram import IGClient
+
+    client = IGClient(log=lambda _m: None)
+    logins = []
+    fake = _types.SimpleNamespace(
+        get_settings=lambda: {
+            "cookies": {"sessionid": "99999%3AotherUSER"},
+            "authorization_data": {"ds_user_id": "99999"},
+        },
+        account_info=lambda: _types.SimpleNamespace(username="someone"),
+        login_by_sessionid=lambda sid: logins.append(sid) or True,
+        username="someone",
+        dump_settings=lambda path: None,
+    )
+    client._client = fake
+
+    client.connect("12345%3AmyTOKEN")
+    assert logins == ["12345%3AmyTOKEN"]      # чужий профіль → повний вхід
