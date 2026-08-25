@@ -496,6 +496,27 @@ class State:
             )
             self.db.commit()
 
+    def cleanup_candidates(self) -> list[sqlite3.Row]:
+        """Пости, чиї локальні файли можна прибрати: завантажені, позначені
+        імпортованими в Eagle і не в черзі перегляду.
+
+        Це лише кандидати — перед видаленням кожен ще звіряється з реальним
+        вмістом бібліотеки Eagle: власна позначка імпорту каже «ми відправили»,
+        а не «воно там є».
+        """
+        with self._lock:
+            return self.db.execute(
+                """
+                SELECT DISTINCT m.pk, m.url FROM media m
+                JOIN files f ON f.media_pk = m.pk
+                JOIN eagle_items e ON e.media_pk = m.pk
+                WHERE m.status = 'done'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM review r
+                      WHERE r.media_pk = m.pk AND r.decided IS NULL)
+                """
+            ).fetchall()
+
     def media_by_url(self) -> dict:
         """Посилання на пост → його pk. Потрібно, щоб упізнати елемент Eagle:
         своїх ідентифікаторів ми там не лишаємо, а адреса поста лишається."""

@@ -842,6 +842,19 @@ class MainWindow(QMainWindow):
         )
         form.addRow(_flabel(""), self.ck_eagle_once)
 
+        self.ck_eagle_cleanup = QCheckBox("Видаляти локальні копії після імпорту")
+        self.ck_eagle_cleanup.setToolTip(
+            "Eagle зберігає власну копію кожного файлу — папка завантажень\n"
+            "стає лише перевалкою. Видаляється тільки підтверджене: те, що\n"
+            "реально видно в бібліотеці, а не просто відправлене."
+        )
+        form.addRow(_flabel(""), self.ck_eagle_cleanup)
+        form.addRow(_flabel(""), _hint(
+            "Памʼять зберігається: прибраний пост ніколи не качається вдруге. "
+            "Щойно відправлене чекає до наступного проходу — копіювання на боці "
+            "Eagle асинхронне, і поспішати з видаленням не можна. Черга перегляду "
+            "не чіпається ніколи."))
+
         self.ck_eagle_per_col = QCheckBox("Підпапка на кожну підбірку")
         form.addRow(_flabel(""), self.ck_eagle_per_col)
 
@@ -1134,6 +1147,7 @@ class MainWindow(QMainWindow):
         self.ed_eagle_root.setText(cfg.eagle_root_folder)
         self.ck_eagle_per_col.setChecked(cfg.eagle_folder_per_collection)
         self.ck_eagle_once.setChecked(cfg.eagle_one_item_per_post)
+        self.ck_eagle_cleanup.setChecked(cfg.eagle_delete_local_after_import)
         self.ck_eagle_tags.setChecked(cfg.eagle_tags_from_hashtags)
         self.ck_eagle_tag_author.setChecked(cfg.eagle_tag_author)
         self.ck_eagle_tag_col.setChecked(cfg.eagle_tag_collection)
@@ -1220,6 +1234,7 @@ class MainWindow(QMainWindow):
         cfg.eagle_root_folder = self.ed_eagle_root.text().strip() or "Instagram Saved"
         cfg.eagle_folder_per_collection = self.ck_eagle_per_col.isChecked()
         cfg.eagle_one_item_per_post = self.ck_eagle_once.isChecked()
+        cfg.eagle_delete_local_after_import = self.ck_eagle_cleanup.isChecked()
         cfg.eagle_tags_from_hashtags = self.ck_eagle_tags.isChecked()
         cfg.eagle_tag_author = self.ck_eagle_tag_author.isChecked()
         cfg.eagle_tag_collection = self.ck_eagle_tag_col.isChecked()

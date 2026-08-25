@@ -3159,3 +3159,93 @@ def test_full_login_still_happens_for_a_different_account(tmp_path):
 
     client.connect("12345%3AmyTOKEN")
     assert logins == ["12345%3AmyTOKEN"]      # чужий профіль → повний вхід
+
+
+# ==========================================================================
+#  Перевалка без осаду: Eagle — база, локальні файли прибираються
+# ==========================================================================
+def test_cleanup_candidates_query(tmp_path):
+    """Кандидат = завантажений + позначений у Eagle + не в черзі перегляду."""
+    state = State(tmp_path / "s.db")
+    try:
+        for pk, status in (("1", "done"), ("2", "done"), ("3", "done"), ("4", "archived")):
+            state.record_media(pk, f"c{pk}", "user", None, 2, "clips", "",
+                               f"https://ig/p/{pk}/", status=status)
+            state.mark_done(pk, status)
+            state.add_file(str(tmp_path / f"{pk}.mp4"), pk, "video", 0, 1)
+
+        state.mark_in_eagle("1", "liked", "f")        # кандидат
+        state.mark_in_eagle("2", "liked", "f")
+        state.add_review("2", "", "", "u", "", "", "", "review")   # чекає рішення
+        # 3 — не в Eagle; 4 — уже archived
+
+        picked = {str(r["pk"]) for r in state.cleanup_candidates()}
+        assert picked == {"1"}
+    finally:
+        state.close()
+
+
+def test_cleanup_deletes_only_what_eagle_confirms(tmp_path, monkeypatch):
+    """Своя позначка каже «відправили», а не «воно там є» — звіряємось із
+    реальним вмістом бібліотеки, бо копіювання на боці Eagle асинхронне."""
+    engine, cfg, state = _engine(tmp_path, eagle_delete_local_after_import=True)
+    try:
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        confirmed = cfg.root / "a.mp4"
+        confirmed.write_bytes(b"x")
+        thumb = cfg.root / "a_thumb.jpg"
+        thumb.write_bytes(b"t")
+        pending = cfg.root / "b.mp4"
+        pending.write_bytes(b"y")
+
+        for pk, path, url in (("1", confirmed, "https://ig/p/AAA/"),
+                              ("2", pending, "https://ig/p/BBB/")):
+            state.record_media(pk, "c", "user", None, 2, "clips", "", url, status="done")
+            state.mark_done(pk)
+            state.add_file(str(path), pk, "video", 0, 1)
+            state.mark_in_eagle(pk, "liked", "f")
+        state.add_file(str(thumb), "1", "thumb", 0, 1)
+
+        engine.eagle = object()   # достатньо, щоб не відсіктись на guard
+        # Eagle «бачить» лише перший пост — другий ще копіюється
+        monkeypatch.setattr(engine, "_eagle_urls", lambda: {"https://ig/p/AAA"})
+        lines = []
+        engine.log = lines.append
+
+        engine._cleanup_imported()
+
+        assert not confirmed.exists() and not thumb.exists()   # підтверджене — прибрано
+        assert pending.exists()                                # непідтверджене — чекає
+        assert state.is_known("1") is True                     # памʼять лишилась
+        assert not state.files_exist("1")
+        assert any("Перевалку прибрано" in line for line in lines)
+        assert any("не видно в бібліотеці" in line for line in lines)
+    finally:
+        state.close()
+
+
+def test_cleanup_does_nothing_when_eagle_is_silent(tmp_path, monkeypatch):
+    """Немає відповіді від Eagle ≠ файлів немає. Мовчання — не привід видаляти."""
+    engine, cfg, state = _engine(tmp_path, eagle_delete_local_after_import=True)
+    try:
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        media = cfg.root / "a.mp4"
+        media.write_bytes(b"x")
+        state.record_media("1", "c", "u", None, 2, "clips", "", "https://ig/p/A/", status="done")
+        state.mark_done("1")
+        state.add_file(str(media), "1", "video", 0, 1)
+        state.mark_in_eagle("1", "liked", "f")
+
+        engine.eagle = object()
+        monkeypatch.setattr(engine, "_eagle_urls", lambda: None)
+        engine._cleanup_imported()
+        assert media.exists()
+
+        # і при вимкненій галочці — теж нічого
+        cfg.eagle_delete_local_after_import = False
+        monkeypatch.setattr(engine, "_eagle_urls",
+                            lambda: (_ for _ in ()).throw(AssertionError("не мав питати")))
+        engine._cleanup_imported()
+        assert media.exists()
+    finally:
+        state.close()

@@ -167,6 +167,7 @@ class SyncEngine:
                 self._flush_eagle()
                 self.state.touch_collection(col.pk)
 
+            self._cleanup_imported()
             self.log(f"Готово: {self.stats.summary()}")
         except InstagramError as exc:
             note = str(exc)
@@ -762,6 +763,81 @@ class SyncEngine:
         path = self.cfg.meta_dir / f"{base}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ------------------------------------------- прибирання перевалки
+    def _eagle_urls(self) -> Optional[set]:
+        """Адреси постів, які РЕАЛЬНО лежать у наших теках Eagle.
+
+        None означає «не вдалось дізнатись» — і тоді нічого не видаляється:
+        відсутність відповіді не є доказом відсутності файлів.
+        """
+        if not self.eagle:
+            return None
+        from .maintenance import _our_folder_ids
+
+        try:
+            folders = _our_folder_ids(self.eagle, self.cfg, self.log)
+            present = set()
+            for item in self.eagle.iter_items(folders):
+                url = str(item.get("url") or "").rstrip("/")
+                if url:
+                    present.add(url)
+            return present
+        except EagleError as exc:
+            self.log(f"Прибирання відкладено: Eagle не віддав список ({exc}).")
+            return None
+
+    def _cleanup_imported(self) -> None:
+        """Прибирає локальні копії постів, які вже підтверджено в Eagle.
+
+        Eagle зберігає власну копію кожного імпортованого файлу, тож папка
+        завантажень — лише перевалка. Але видаляти одразу після відправки не
+        можна: копіювання на боці Eagle асинхронне, і поспішне видалення
+        лишило б бібліотеку без файлу. Тому кожен кандидат звіряється з
+        реальним вмістом бібліотеки за адресою поста; щойно відправлене
+        природно чекає до наступного проходу.
+
+        Памʼять зберігається: пост стає archived і ніколи не качається вдруге.
+        """
+        if not self.cfg.eagle_delete_local_after_import:
+            return
+        candidates = self.state.cleanup_candidates()
+        if not candidates:
+            return
+        present = self._eagle_urls()
+        if not present:
+            return
+
+        removed_posts = removed_files = waiting = 0
+        for row in candidates:
+            if self.should_stop():
+                break
+            url = str(row["url"] or "").rstrip("/")
+            if not url or url not in present:
+                waiting += 1
+                continue
+            for path_text in self.state.media_files(
+                    str(row["pk"]), ("video", "photo", "thumb")):
+                path = Path(path_text)
+                try:
+                    if path.exists():
+                        path.unlink()
+                        removed_files += 1
+                except OSError as exc:
+                    self.log(f"   ⤼ не видалилось {path.name}: {exc}")
+            self.state.mark_archived(str(row["pk"]))
+            removed_posts += 1
+
+        if removed_posts:
+            self.log(
+                f"Перевалку прибрано: {removed_posts} пост(ів), "
+                f"{removed_files} файл(ів) — усі вже в Eagle."
+            )
+        if waiting:
+            self.log(
+                f"   {waiting} пост(ів) ще не видно в бібліотеці — "
+                "лишаю до наступного проходу."
+            )
 
     # =============================================================== Eagle
     def _setup_eagle(self) -> None:

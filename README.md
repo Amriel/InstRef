@@ -29,7 +29,10 @@ go into the MP4 iTunes atoms and JPEG EXIF — including the Windows XP fields,
 so Explorer shows them. No sidecar files needed.
 
 **Imports into Eagle** with tags and annotations, one item per post, into the
-folder you nominate.
+folder you nominate. Eagle keeps its own copy of every file, so InstRef can
+optionally **clean up after itself**: once a post is confirmed present in the
+library, the local copy is deleted — while still remembered, so nothing is
+ever downloaded twice. The download folder is a staging area, not an archive.
 
 **Describes what it sees.** A vision model in [LM Studio](https://lmstudio.ai/)
 looks at frames sampled across the whole clip — not the cover, which for reels
