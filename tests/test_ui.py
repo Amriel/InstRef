@@ -25,7 +25,17 @@ from igsaved.state import REVIEW_MODEL, REVIEW_RULES, State  # noqa: E402
 
 @pytest.fixture(scope="session")
 def app():
-    return QApplication.instance() or QApplication([])
+    application = QApplication.instance() or QApplication([])
+    yield application
+    # Qt-обʼєкти, що доживають до завершення інтерпретатора, валять процес
+    # уже ПІСЛЯ «209 passed»: segfault на Linux, exit code 1 на Windows —
+    # і CI червоний при зелених тестах. Тому прибираємо все явно.
+    for widget in application.topLevelWidgets():
+        widget.close()
+        widget.deleteLater()
+    application.processEvents()
+    application.sendPostedEvents()
+    application.processEvents()
 
 
 @pytest.fixture
@@ -48,7 +58,10 @@ def window(app, tmp_path, monkeypatch):
     win.cfg.save = lambda *a, **k: None
     win.review_tab.cfg = win.cfg
     yield win
+    win.tray.hide()
     win.close()
+    win.deleteLater()
+    app.processEvents()
 
 
 def _seed_review(state: State, root: Path):
