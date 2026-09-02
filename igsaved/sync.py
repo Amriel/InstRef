@@ -15,18 +15,21 @@ from . import frames as framegrab
 from . import taxonomy
 from . import vision
 from .classify import DOWNLOAD, REVIEW, SKIP, Rules
-from .config import Config, DEVICE_PATH, STRUCTURE_PER_COLLECTION
+from .config import Config, DEVICE_PATH, LOCK_PATH, STRUCTURE_PER_COLLECTION
 from .downloader import Downloader, TooLarge, human_size
 from .eagle import EagleClient, EagleError, EagleItem
 from .instagram import (
     CollectionInfo,
     IGClient,
     InstagramError,
+    RateLimited,
+    SessionDead,
     collect_assets,
     label_for,
     media_to_dict,
     media_url,
 )
+from .lock import LockHeld, RunLock
 from . import tagging
 from .naming import (
     asset_name, caption_slug, ext_from_url, hashtags, render_template, safe_component,
@@ -50,6 +53,15 @@ class Stats:
     filtered: int = 0        # відсіяно як меми
     to_review: int = 0       # відкладено на ревʼю
     errors: List[str] = field(default_factory=list)
+    # Чому прохід не відбувся взагалі: "" | cooldown | locked | rate_limited |
+    # session_dead. Це не помилка обробки — це підстава не турбувати
+    # користувача вікном «синхронізація з помилками».
+    reason: str = ""
+    gave_up: List[str] = field(default_factory=list)   # пости, які більше не чіпаємо
+
+    @property
+    def skipped_run(self) -> bool:
+        return self.reason in ("cooldown", "locked")
 
     def summary(self) -> str:
         return (
@@ -114,17 +126,40 @@ class SyncEngine:
 
     # ================================================================== запуск
     def cooldown_left(self) -> float:
-        """Скільки годин лишилось до дозволеного наступного проходу."""
+        """Скільки годин лишилось до дозволеного наступного проходу.
+
+        Дві причини чекати: звичайна межа між проходами і примусова пауза
+        після відповіді Instagram «зачекай». Береться більша.
+        """
+        left = 0.0
         limit = float(self.cfg.min_hours_between_runs or 0)
-        if limit <= 0:
-            return 0.0
         passed = self.state.hours_since_last_run()
-        if passed is None:
-            return 0.0
-        return max(0.0, limit - passed)
+        if limit > 0 and passed is not None:
+            left = max(0.0, limit - passed)
+        forced = self.state.cooldown_until()
+        if forced is not None:
+            from datetime import timezone
+            hours = (forced - datetime.now(timezone.utc)).total_seconds() / 3600.0
+            left = max(left, hours)
+        return left
 
     def run(self, only_collections: Optional[List[str]] = None,
             force: bool = False) -> Stats:
+        forced = self.state.cooldown_until()
+        if forced is not None:
+            # Примусову паузу після 429 не обходить навіть ручний запуск: вона
+            # захищає акаунт, а не зручність.
+            from datetime import timezone
+            minutes = int((forced - datetime.now(timezone.utc)).total_seconds() // 60)
+            self.log(
+                f"Пропускаю прохід: Instagram попросив зупинитись. "
+                f"Наступний можна через {max(minutes, 1)} хв "
+                f"({forced.astimezone().strftime('%d.%m %H:%M')})."
+            )
+            self.stats.errors.append("cooldown")
+            self.stats.reason = "cooldown"
+            return self.stats
+
         left = 0.0 if force else self.cooldown_left()
         if left > 0:
             # Свідомо гучно: тиха відмова тут виглядала б як «нічого не знайшлось».
@@ -138,8 +173,24 @@ class SyncEngine:
                 "застосунок як автоматизацію. Змінити межу: Налаштування → Сканування."
             )
             self.stats.errors.append("cooldown")
+            self.stats.reason = "cooldown"
             return self.stats
 
+        lock = RunLock(LOCK_PATH)
+        try:
+            lock.acquire()
+        except LockHeld as exc:
+            self.log(f"Пропускаю прохід: {exc}")
+            self.stats.errors.append("locked")
+            self.stats.reason = "locked"
+            return self.stats
+        try:
+            return self._run_locked(only_collections)
+        finally:
+            lock.release()
+
+    def _run_locked(self, only_collections: Optional[List[str]]) -> Stats:
+        self.state.backup_if_due()
         run_id = self.state.start_run()
         note = ""
         try:
@@ -168,7 +219,16 @@ class SyncEngine:
                 self.state.touch_collection(col.pk)
 
             self._cleanup_imported()
+            self._report_given_up()
             self.log(f"Готово: {self.stats.summary()}")
+        except RateLimited as exc:
+            note = self._enter_rate_limit(exc)
+        except SessionDead as exc:
+            note = str(exc)
+            self.stats.errors.append(note)
+            self.stats.reason = "session_dead"
+            self.log(f"✖ {note}")
+            self.log("  Онови sessionid на вкладці «Сесія» — планові проходи стоятимуть, доки не оновиш.")
         except InstagramError as exc:
             note = str(exc)
             self.stats.errors.append(note)
@@ -190,6 +250,41 @@ class SyncEngine:
                 self.stats.skipped, self.stats.failed, note,
             )
         return self.stats
+
+    def _enter_rate_limit(self, exc: Exception) -> str:
+        """Instagram сказав «зачекай» — зупиняємо все й ставимо примусову паузу."""
+        from datetime import timedelta, timezone
+
+        hours = float(self.cfg.rate_limit_cooldown_hours or 0)
+        note = str(exc)
+        self.stats.errors.append(note)
+        self.stats.reason = "rate_limited"
+        self.log(f"✖ {note}")
+        if hours > 0:
+            until = datetime.now(timezone.utc) + timedelta(hours=hours)
+            self.state.set_cooldown_until(until)
+            self.log(
+                f"  Прохід зупинено цілком. Наступний — не раніше "
+                f"{until.astimezone().strftime('%d.%m %H:%M')} ({hours:g} год): "
+                "продовжувати після такої відповіді означає підтвердити підозру."
+            )
+        return note
+
+    def _report_given_up(self) -> None:
+        """Пости, які застосунок перестав пробувати, — вголос, а не в тиші бази."""
+        rows = self.state.given_up()
+        if not rows:
+            return
+        self.stats.gave_up = [str(r["pk"]) for r in rows]
+        self.log(
+            f"⚠ {len(rows)} пост(ів) не вдалось узяти після "
+            f"{self.cfg.max_post_attempts} спроб — більше не пробую:"
+        )
+        for row in rows[:10]:
+            who = f"@{row['username']}" if row["username"] else row["pk"]
+            self.log(f"   • {who}: {row['last_error'] or '?'}  {row['url'] or ''}")
+        if len(rows) > 10:
+            self.log(f"   … і ще {len(rows) - 10}. Повний список — у вкладці «Додатково».")
 
     # ------------------------------------------------------------- підбірки
     def list_collections(self) -> List[CollectionInfo]:
@@ -568,19 +663,41 @@ class SyncEngine:
 
                 try:
                     self._process_media(media, col, verdict)
+                    self.state.clear_failures(pk)
+                except RateLimited:
+                    raise
                 except Exception as exc:  # noqa: BLE001
-                    self.stats.failed += 1
-                    message = f"{pk}: {exc}"
-                    self.stats.errors.append(message)
-                    self.log(f"   ✖ {message}")
+                    self._note_failure(media, pk, exc)
 
                 if self.cfg.max_items_per_run and self.stats.downloaded >= self.cfg.max_items_per_run:
                     self.log(f"   ліміт {self.cfg.max_items_per_run} нових постів за запуск досягнуто")
                     return
+        except RateLimited:
+            raise
         except InstagramError as exc:
             self.stats.failed += 1
             self.stats.errors.append(str(exc))
             self.log(f"   ✖ {exc}")
+
+    def _note_failure(self, media, pk: str, exc: Exception) -> None:
+        """Невдача по одному посту: рахуємо, після N — здаємось."""
+        self.stats.failed += 1
+        message = f"{pk}: {exc}"
+        self.stats.errors.append(message)
+        user = getattr(media, "user", None)
+        attempts = self.state.mark_failure(
+            pk, str(exc),
+            code=getattr(media, "code", "") or "",
+            username=(getattr(user, "username", "") if user else "") or "",
+            url=media_url(getattr(media, "code", "") or ""),
+            max_attempts=int(self.cfg.max_post_attempts or 0),
+        )
+        limit = int(self.cfg.max_post_attempts or 0)
+        if limit and attempts >= limit:
+            self.log(f"   ✖ {message} — спроба {attempts}/{limit}, більше не пробую")
+        else:
+            self.log(f"   ✖ {message} — спроба {attempts}" + (f"/{limit}" if limit else ""))
+        self._drop_prefetch(pk)
 
     # ------------------------------------------------------- один пост
     def _process_media(self, media, col: CollectionInfo, verdict=None) -> None:

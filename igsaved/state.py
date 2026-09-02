@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
+
+# Скільки резервних копій бази тримати і як часто робити планову.
+BACKUP_KEEP = 5
+BACKUP_EVERY_DAYS = 7
+# Після стількох невдалих спроб пост більше не чіпаємо (див. mark_failure).
+DEFAULT_MAX_ATTEMPTS = 3
 
 # Хто поставив пост у чергу: правила (людина має вирішити) чи модель
 # (вона вже вирішила, людині лишається глянути й за потреби скасувати).
@@ -88,6 +94,10 @@ CREATE TABLE IF NOT EXISTS tag_candidates (
     last_seen  TEXT,
     state      TEXT DEFAULT 'new'
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT,
@@ -114,6 +124,7 @@ def _ai_row(row) -> dict:
         "tags": [t for t in (row["tags"] or "").split("\n") if t],
         "model": row["model"] or "",
         "frames": int(row["frames"] or 0),
+        "prompt_hash": (row["prompt_hash"] or "") if "prompt_hash" in row.keys() else "",
     }
 
 
@@ -127,20 +138,34 @@ class State:
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         with self._lock:
+            existed = self._columns("media")
             self.db.executescript(SCHEMA)
             self.db.execute("PRAGMA journal_mode=WAL")
+            if existed and self._needs_migration():
+                # Міграція переписує таблиці; якщо вона впаде посередині,
+                # без копії відновлювати буде нізвідки.
+                self.backup("pre-migration")
             self._add_missing_columns()
             self.db.commit()
+
+    MISSING = (
+        ("review", "source", "TEXT DEFAULT 'rules'"),
+        ("media", "attempts", "INTEGER DEFAULT 0"),
+        ("media", "last_error", "TEXT"),
+        ("ai_meta", "prompt_hash", "TEXT"),
+        ("eagle_items", "item_id", "TEXT"),
+    )
+
+    def _needs_migration(self) -> bool:
+        for table, column, _definition in self.MISSING:
+            if column not in self._columns(table):
+                return True
+        columns = self._columns("ai_meta")
+        return bool(columns) and "idx" not in columns
 
     def _add_missing_columns(self) -> None:
         """CREATE TABLE IF NOT EXISTS не змінює вже створену таблицю, тож нові
         стовпці доводиться доливати руками — інакше стара база валить запити."""
-        for table, column, definition in (
-            ("review", "source", "TEXT DEFAULT 'rules'"),
-        ):
-            if column not in self._columns(table):
-                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
         # ai_meta переїхала з ключа (media_pk) на (media_pk, idx): у каруселі
         # кожен слайд — окрема картинка й заслуговує власного опису. ALTER
         # первинний ключ не міняє, тож таблицю доводиться перезбирати.
@@ -169,6 +194,12 @@ class State:
                 """
             )
 
+        # Нові стовпці — після перезбирання: інакше вони додались би до старої
+        # таблиці й зникли разом із нею.
+        for table, column, definition in self.MISSING:
+            if column not in self._columns(table):
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def _columns(self, table: str) -> set:
         return {
             row["name"]
@@ -178,6 +209,94 @@ class State:
     def close(self) -> None:
         with self._lock:
             self.db.close()
+
+    # ---------------------------------------------------------- резервні копії
+    @property
+    def backup_dir(self) -> Path:
+        return self.path.parent / "backups"
+
+    def backup(self, reason: str = "scheduled") -> Optional[Path]:
+        """Знімок бази через sqlite backup API — узгоджений навіть при WAL.
+
+        Файл: backups/state_YYYYMMDD_HHMMSS_<reason>.db. Тримаємо BACKUP_KEEP
+        найновіших: база — єдина памʼять про те, що вже завантажено, і без неї
+        наступний прохід потягне всю бібліотеку заново.
+        """
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            target = self.backup_dir / f"state_{stamp}_{reason}.db"
+            n = 1
+            while target.exists():
+                n += 1
+                target = self.backup_dir / f"state_{stamp}_{n}_{reason}.db"
+            with self._lock:
+                copy = sqlite3.connect(str(target))
+                try:
+                    self.db.backup(copy)
+                finally:
+                    copy.close()
+            self._prune_backups()
+            return target
+        except (OSError, sqlite3.Error):
+            return None
+
+    def _prune_backups(self) -> None:
+        files = sorted(self.backup_dir.glob("state_*.db"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-BACKUP_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+    def backup_if_due(self, reason: str = "weekly") -> Optional[Path]:
+        """Планова копія — не частіше, ніж раз на BACKUP_EVERY_DAYS."""
+        last = self.get_meta("last_backup")
+        if last:
+            try:
+                when = datetime.fromisoformat(last)
+                if datetime.now(timezone.utc) - when < timedelta(days=BACKUP_EVERY_DAYS):
+                    return None
+            except ValueError:
+                pass
+        made = self.backup(reason)
+        if made is not None:
+            self.set_meta("last_backup", _now())
+        return made
+
+    # -------------------------------------------------------- ключ/значення
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row and row["value"] is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO meta (key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+            self.db.commit()
+
+    # ------------------------------------------------ примусова пауза (429)
+    def set_cooldown_until(self, until: datetime) -> None:
+        self.set_meta("cooldown_until", until.astimezone(timezone.utc).isoformat(timespec="seconds"))
+
+    def cooldown_until(self) -> Optional[datetime]:
+        raw = self.get_meta("cooldown_until")
+        if not raw:
+            return None
+        try:
+            when = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return when if when > datetime.now(timezone.utc) else None
+
+    def clear_cooldown(self) -> None:
+        self.set_meta("cooldown_until", "")
 
     # ------------------------------------------------------------- медіа
     def is_downloaded(self, pk: str) -> bool:
@@ -201,7 +320,7 @@ class State:
             ).fetchone()
         if not row:
             return False
-        if row["status"] == "archived":
+        if row["status"] in ("archived", "gave_up"):
             return True
         return row["status"] == "done" and self.files_exist(pk)
 
@@ -376,19 +495,47 @@ class State:
                 " GROUP BY media_pk HAVING copies > 1 ORDER BY copies DESC"
             ).fetchall()
 
-    def mark_in_eagle(self, media_pk: str, collection_pk: str, folder_id: str) -> None:
+    def mark_in_eagle(self, media_pk: str, collection_pk: str, folder_id: str,
+                      item_id: str = "") -> None:
         with self._lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO eagle_items (media_pk, collection_pk, folder_id, imported_at)"
-                " VALUES (?,?,?,?)",
-                (str(media_pk), str(collection_pk), folder_id, _now()),
+                "INSERT OR REPLACE INTO eagle_items"
+                " (media_pk, collection_pk, folder_id, imported_at, item_id)"
+                " VALUES (?,?,?,?,?)",
+                (str(media_pk), str(collection_pk), folder_id, _now(), item_id or ""),
             )
             self.db.commit()
+
+    def set_eagle_item_id(self, media_pk: str, item_id: str) -> None:
+        """Ідентифікатор елемента Eagle, коли він став відомий (імпорт
+        асинхронний, тож зазвичай — з наступного проходу)."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE eagle_items SET item_id = ? WHERE media_pk = ?"
+                " AND COALESCE(item_id, '') = ''",
+                (str(item_id), str(media_pk)),
+            )
+            self.db.commit()
+
+    def eagle_item_ids(self) -> dict:
+        """pk → id елемента Eagle для всього, що вже відоме."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT media_pk, item_id FROM eagle_items WHERE COALESCE(item_id, '') <> ''"
+            ).fetchall()
+        return {str(r["media_pk"]): str(r["item_id"]) for r in rows}
+
+    def without_eagle_item_id(self) -> list[str]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT DISTINCT media_pk FROM eagle_items WHERE COALESCE(item_id, '') = ''"
+            ).fetchall()
+        return [str(r["media_pk"]) for r in rows]
 
     # ------------------------------------------------- опис від моделі
     def set_ai_meta(self, media_pk: str, category: str, confidence: float,
                     description: str, tags: Iterable[str], model: str = "",
-                    frames: int = 0, idx: int = 0) -> None:
+                    frames: int = 0, idx: int = 0, prompt_hash: str = "") -> None:
         """Те, що модель написала про пост. Живе окремо від media, бо
         зʼявляється ще до того, як пост вирішено качати.
 
@@ -397,10 +544,11 @@ class State:
         with self._lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO ai_meta (media_pk, idx, category, confidence,"
-                " description, tags, model, frames, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " description, tags, model, frames, created_at, prompt_hash)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (str(media_pk), int(idx or 0), category or "", float(confidence or 0.0),
                  description or "", "\n".join(str(t) for t in (tags or []) if t),
-                 model or "", int(frames or 0), _now()),
+                 model or "", int(frames or 0), _now(), prompt_hash or ""),
             )
             self.db.commit()
 
@@ -624,6 +772,63 @@ class State:
                 "SELECT status FROM media WHERE pk = ?", (str(pk),)
             ).fetchone()
         return bool(row and row["status"] == "skipped")
+
+    # ------------------------------------------------ облік невдач
+    def mark_failure(self, pk: str, error: str, code: str = "", username: str = "",
+                     url: str = "", max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> int:
+        """Пост не вдалось обробити. Повертає, скільки спроб уже було.
+
+        Після max_attempts пост отримує статус gave_up і більше не чіпається:
+        видалений автором чи битий ролик інакше повторювався б кожен прохід,
+        витрачаючи запити до Instagram нізащо. Рядок у media створюється, якщо
+        його ще немає — збій міг статись ще до record_media.
+        """
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO media (pk, code, username, url, first_seen, status, attempts)"
+                " VALUES (?,?,?,?,?,'failed',0) ON CONFLICT(pk) DO NOTHING",
+                (str(pk), code or "", username or "", url or "", _now()),
+            )
+            self.db.execute(
+                "UPDATE media SET attempts = COALESCE(attempts, 0) + 1, last_error = ?"
+                " WHERE pk = ?",
+                (str(error)[:300], str(pk)),
+            )
+            row = self.db.execute(
+                "SELECT attempts, status FROM media WHERE pk = ?", (str(pk),)
+            ).fetchone()
+            attempts = int(row["attempts"] or 0) if row else 0
+            if max_attempts and attempts >= max_attempts and row["status"] not in ("done", "archived"):
+                self.db.execute(
+                    "UPDATE media SET status = 'gave_up' WHERE pk = ?", (str(pk),)
+                )
+            self.db.commit()
+        return attempts
+
+    def clear_failures(self, pk: str) -> None:
+        """Пост нарешті пройшов — лічильник більше не потрібен."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE media SET attempts = 0, last_error = NULL WHERE pk = ?", (str(pk),)
+            )
+            self.db.commit()
+
+    def given_up(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.db.execute(
+                "SELECT pk, username, url, attempts, last_error FROM media"
+                " WHERE status = 'gave_up' ORDER BY first_seen DESC"
+            ).fetchall()
+
+    def retry_given_up(self) -> int:
+        """Повертає всі gave_up у гру (наприклад, після зміни налаштувань)."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE media SET status = 'failed', attempts = 0, last_error = NULL"
+                " WHERE status = 'gave_up'"
+            )
+            self.db.commit()
+            return int(cur.rowcount or 0)
 
     # ------------------------------------------------------- підбірки
     def upsert_collection(self, pk: str, name: str, media_count: int) -> None:

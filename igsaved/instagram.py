@@ -37,6 +37,38 @@ class InstagramError(RuntimeError):
     """Помилка, яку варто показати користувачу як є."""
 
 
+class RateLimited(InstagramError):
+    """Instagram попросив зачекати (429 / PleaseWaitFewMinutes / feedback_required).
+
+    Це не «спробуй ще раз» — це «зупинись». Продовжувати прохід після такої
+    відповіді означає підтвердити підозру в автоматизації.
+    """
+
+
+class SessionDead(InstagramError):
+    """Сесія протухла або акаунт вимагає підтвердження (challenge/login)."""
+
+
+# Ознаки у тексті винятку instagrapi, за якими впізнаємо обмеження. Класи
+# винятків імпортувати не хочемо: бібліотека їх перейменовує між версіями.
+_RATE_MARKS = ("pleasewaitfewminutes", "please wait", "rate limit", "ratelimit",
+               "429", "feedback_required", "feedbackrequired", "too many")
+_SESSION_MARKS = ("loginrequired", "login_required", "challengerequired",
+                  "challenge_required", "checkpoint", "sessionid", "not logged in")
+
+
+def classify_error(exc: Exception) -> type:
+    """Який наш виняток відповідає помилці instagrapi."""
+    name = exc.__class__.__name__.lower()
+    text = f"{name} {exc}".lower()
+    if any(mark in text for mark in _RATE_MARKS):
+        return RateLimited
+    if any(mark in name for mark in ("loginrequired", "challengerequired")) or \
+            any(mark in text for mark in _SESSION_MARKS):
+        return SessionDead
+    return InstagramError
+
+
 class IGClient:
     """Обгортка над instagrapi.Client із логуванням та ввічливими паузами."""
 
@@ -103,9 +135,12 @@ class IGClient:
         try:
             ok = self.client.login_by_sessionid(sessionid)
         except Exception as exc:  # noqa: BLE001
-            raise InstagramError(f"Instagram відхилив сесію: {exc}") from exc
+            kind = classify_error(exc)
+            if kind is RateLimited:
+                raise RateLimited(f"Instagram попросив зупинитись: {_short(exc)}") from exc
+            raise SessionDead(f"Instagram відхилив сесію: {exc}") from exc
         if not ok:
-            raise InstagramError("Instagram не прийняв sessionid. Онови його на вкладці «Сесія».")
+            raise SessionDead("Instagram не прийняв sessionid. Онови його на вкладці «Сесія».")
         try:
             self.username = self.client.account_info().username
         except Exception:  # noqa: BLE001 — не критично
@@ -194,6 +229,15 @@ class IGClient:
                     str(collection_pk), max_id=cursor
                 )
             except Exception as exc:  # noqa: BLE001
+                kind = classify_error(exc)
+                if kind is RateLimited:
+                    raise RateLimited(
+                        f"Instagram попросив зупинитись: {_short(exc)}"
+                    ) from exc
+                if kind is SessionDead:
+                    raise SessionDead(
+                        f"Сесія Instagram більше не дійсна: {_short(exc)}"
+                    ) from exc
                 raise InstagramError(f"Помилка запиту до Instagram: {exc}") from exc
 
             page += 1

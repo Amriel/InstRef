@@ -565,6 +565,28 @@ class MainWindow(QMainWindow):
             "Кожен прохід — це вхід і десятки запитів. Кілька проходів поспіль із "
             "різницею у хвилини — найпомітніший слід автоматизації, і саме за нього "
             "приходить попередження від Instagram."))
+
+        self.sp_rate_cooldown = QDoubleSpinBox()
+        self.sp_rate_cooldown.setRange(0.0, 168.0)
+        self.sp_rate_cooldown.setSingleStep(1.0)
+        self.sp_rate_cooldown.setDecimals(0)
+        self.sp_rate_cooldown.setSuffix(" год")
+        self.sp_rate_cooldown.setSpecialValueText("не зупинятись")
+        self.sp_rate_cooldown.setFixedWidth(150)
+        form.addRow(_flabel("Після «зачекай» від Instagram"), _row(_left(self.sp_rate_cooldown)))
+        form.addRow(_flabel(""), _hint(
+            "Відповідь «Please wait a few minutes» або 429 зупиняє весь прохід, і "
+            "стільки годин застосунок не повертається — навіть за ручним запуском."))
+
+        self.sp_attempts = QSpinBox()
+        self.sp_attempts.setRange(0, 20)
+        self.sp_attempts.setSpecialValueText("без межі")
+        self.sp_attempts.setSuffix(" спроб")
+        self.sp_attempts.setFixedWidth(150)
+        form.addRow(_flabel("Спроб на один пост"), _row(_left(self.sp_attempts)))
+        form.addRow(_flabel(""), _hint(
+            "Видалений автором чи битий пост інакше повторювався б кожен прохід. "
+            "Після цієї кількості невдач він відкладається; список — у «Додатково»."))
         return page
 
     # -------------------------------------------------- розділ «Пролайкане»
@@ -934,6 +956,16 @@ class MainWindow(QMainWindow):
         self.lbl_sched = _hint("")
         form.addRow(_flabel(""), self.lbl_sched)
 
+        self.sp_jitter = QSpinBox()
+        self.sp_jitter.setRange(0, 120)
+        self.sp_jitter.setSpecialValueText("без зсуву")
+        self.sp_jitter.setSuffix(" хв")
+        self.sp_jitter.setFixedWidth(130)
+        form.addRow(_flabel("Випадковий зсув"), _row(_left(self.sp_jitter)))
+        form.addRow(_flabel(""), _hint(
+            "Плановий прохід починається не рівно за розкладом, а у випадковий "
+            "момент у цьому вікні. Рівно о 09:00:00 щодня — підпис скрипта."))
+
         _gap(form)
 
         self.ck_run_at_login = QCheckBox("Запускати застосунок разом із Windows")
@@ -1000,6 +1032,12 @@ class MainWindow(QMainWindow):
             "Спершу лише показує; видаляти чи ні — вирішуєш ти."
         )
         self.btn_dupes.clicked.connect(self.on_find_dupes)
+        self.btn_given_up = QPushButton("Пости, від яких відмовились")
+        self.btn_given_up.setToolTip(
+            "Пости, які не вдалось узяти після кількох спроб.\n"
+            "Можна подивитись причини і повернути їх у чергу."
+        )
+        self.btn_given_up.clicked.connect(self.on_given_up)
         self.btn_shortcut = QPushButton("Ярлик на робочому столі")
         self.btn_shortcut.setToolTip("Створює ярлик із нормальною іконкою замість .bat")
         self.btn_shortcut.clicked.connect(self.on_make_shortcut)
@@ -1021,7 +1059,7 @@ class MainWindow(QMainWindow):
         actions = QVBoxLayout()
         actions.setSpacing(6)
         for widget in (self.btn_refresh_library, self.btn_push_eagle, self.btn_describe,
-                       self.btn_dupes, self.btn_shortcut,
+                       self.btn_dupes, self.btn_given_up, self.btn_shortcut,
                        self.btn_clear_downloads, self.btn_forget_downloads,
                        self.btn_reset_settings):
             widget.setMinimumHeight(34)
@@ -1108,6 +1146,9 @@ class MainWindow(QMainWindow):
         self.sp_delay_min.setValue(cfg.page_delay_min)
         self.sp_delay_max.setValue(cfg.page_delay_max)
         self.sp_cooldown.setValue(cfg.min_hours_between_runs)
+        self.sp_rate_cooldown.setValue(cfg.rate_limit_cooldown_hours)
+        self.sp_attempts.setValue(cfg.max_post_attempts)
+        self.sp_jitter.setValue(cfg.schedule_jitter_minutes)
         self.sp_timeout.setValue(cfg.request_timeout)
         self.sp_retries.setValue(cfg.max_retries)
         self.ed_proxy.setText(cfg.proxy)
@@ -1195,6 +1236,9 @@ class MainWindow(QMainWindow):
         cfg.page_delay_min = self.sp_delay_min.value()
         cfg.page_delay_max = max(self.sp_delay_max.value(), self.sp_delay_min.value())
         cfg.min_hours_between_runs = self.sp_cooldown.value()
+        cfg.rate_limit_cooldown_hours = self.sp_rate_cooldown.value()
+        cfg.max_post_attempts = self.sp_attempts.value()
+        cfg.schedule_jitter_minutes = self.sp_jitter.value()
         cfg.request_timeout = self.sp_timeout.value()
         cfg.max_retries = self.sp_retries.value()
         cfg.proxy = self.ed_proxy.text().strip()
@@ -1669,6 +1713,27 @@ class MainWindow(QMainWindow):
         self._log(f"═══ {stats.summary()} ═══")
         self._notify(f"{APP_NAME}: опис бібліотеки", stats.summary())
 
+    def on_given_up(self) -> None:
+        rows = self.state.given_up()
+        if not rows:
+            QMessageBox.information(self, APP_NAME, "Таких постів немає — усе взялось.")
+            return
+        lines = []
+        for row in rows[:40]:
+            who = f"@{row['username']}" if row["username"] else row["pk"]
+            lines.append(f"• {who} — {row['last_error'] or '?'}\n   {row['url'] or ''}")
+        more = f"\n… і ще {len(rows) - 40}" if len(rows) > 40 else ""
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"{len(rows)} пост(ів) відкладено після {self.cfg.max_post_attempts} спроб:\n\n"
+            + "\n".join(lines) + more
+            + "\n\nПовернути їх у чергу? Наступний прохід спробує ще раз.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer == QMessageBox.Yes:
+            count = self.state.retry_given_up()
+            self._log(f"Повернуто в чергу: {count} пост(ів).")
+
     def on_find_dupes(self) -> None:
         """Показує дублікати в Eagle. Видаляє тільки після окремої згоди."""
         if self.dupe_worker and self.dupe_worker.isRunning():
@@ -2063,6 +2128,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100 if not stats.errors else 0)
         self.progress.setFormat("Завершено")
         self.progress_label.setText(stats.summary())
+        if stats.skipped_run:
+            self.progress.setFormat("Пропущено")
+            self.progress_label.setText("Прохід пропущено — див. журнал")
+            return
         self._log(f"═══ Підсумок: {stats.summary()} ═══")
         self._fill_table()
         self._update_totals()
@@ -2077,6 +2146,14 @@ class MainWindow(QMainWindow):
             f"{APP_NAME}: синхронізацію завершено",
             stats.summary() + (f"\n{stats.errors[0]}" if stats.errors else ""),
         )
+        if stats.reason == "rate_limited":
+            QMessageBox.warning(
+                self, APP_NAME,
+                "Instagram попросив зупинитись.\n\nПрохід перервано, і застосунок "
+                f"не звертатиметься до Instagram {self.cfg.rate_limit_cooldown_hours:g} год. "
+                "Це захист акаунта: продовжувати після такої відповіді означає "
+                "підтвердити підозру в автоматизації.",
+            )
 
     # =============================================================== дрібне
     def _require_session(self) -> bool:

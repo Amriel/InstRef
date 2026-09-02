@@ -31,3 +31,7 @@ Thumbs.db
 
 # local scratch
 _to_delete/
+
+# робочі файли поруч із базою
+sync.lock
+backups/

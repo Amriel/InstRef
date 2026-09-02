@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -47,6 +48,7 @@ SESSION_PATH = app_dir() / "session.json"
 DEVICE_PATH = app_dir() / "device.json"
 STATE_PATH = app_dir() / "state.db"
 STATUS_PATH = app_dir() / "last_run.json"
+LOCK_PATH = app_dir() / "sync.lock"
 LOG_DIR = app_dir() / "logs"
 
 # Псевдо-підбірка «всі збережені» — так її називає приватне API Instagram.
@@ -142,6 +144,12 @@ class Config:
     # кілька проходів поспіль з різницею у хвилини — найпомітніший слід
     # автоматизації. 0 = без обмеження (не радимо).
     min_hours_between_runs: float = 6.0
+    # Instagram відповів «зачекай кілька хвилин» / 429: зупиняємо ВЕСЬ прохід
+    # і не повертаємось стільки годин. Продовжувати після такої відповіді —
+    # найкоротший шлях до блокування.
+    rate_limit_cooldown_hours: float = 24.0
+    # Після стількох невдалих спроб пост більше не чіпаємо (gave_up).
+    max_post_attempts: int = 3
     proxy: str = ""  # напр. http://user:pass@host:port
 
     # --- Eagle ---
@@ -173,6 +181,9 @@ class Config:
     schedule_interval_hours: int = 6
     schedule_weekday: str = "MON"
     schedule_task_name: str = "InstRef Sync"
+    # Випадковий зсув перед плановим проходом: щодня рівно о 09:00:00 — це
+    # підпис скрипта, людина так не заходить.
+    schedule_jitter_minutes: int = 20
     run_on_windows_start: bool = False
     sync_on_launch: bool = False
     minimize_to_tray: bool = True
@@ -319,22 +330,83 @@ class Config:
 
 # --------------------------------------------------------------------------
 # Сесія Instagram зберігається окремо від config.json (це секрет).
+#
+# На Windows вміст шифрується DPAPI (CryptProtectData) — ключ привʼязаний до
+# облікового запису Windows, тож скопійований session.json на іншій машині
+# або під іншим користувачем не читається. Без сторонніх залежностей: ctypes.
+# На інших системах файл лишається відкритим JSON із правами 0600.
 # --------------------------------------------------------------------------
+DPAPI_KEY = "dpapi"
+DPAPI_DESCRIPTION = "InstRef session"
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+        buffer = ctypes.create_string_buffer(data, len(data))
+        blob_in = DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+        blob_out = DataBlob()
+        flags = 0x01  # CRYPTPROTECT_UI_FORBIDDEN — без діалогів у фоновому запуску
+        if protect:
+            ok = crypt32.CryptProtectData(
+                ctypes.byref(blob_in), DPAPI_DESCRIPTION, None, None, None, flags,
+                ctypes.byref(blob_out))
+        else:
+            ok = crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, None, None, None, flags, ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(blob_out.pbData)
+    except Exception:  # noqa: BLE001 — шифрування не має ламати вхід
+        return None
+
+
 def load_session(path: Path | None = None) -> Dict[str, Any]:
     path = path or SESSION_PATH
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+    if isinstance(raw, dict) and DPAPI_KEY in raw:
+        try:
+            plain = _dpapi(base64.b64decode(raw[DPAPI_KEY]), protect=False)
+        except (ValueError, TypeError):
+            plain = None
+        if plain is None:
+            return {}
+        try:
+            return json.loads(plain.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+    if isinstance(raw, dict) and raw.get("sessionid") and sys.platform == "win32":
+        # Старий відкритий файл — перезаписуємо зашифрованим за першої нагоди.
+        save_session(raw, path)
+    return raw if isinstance(raw, dict) else {}
 
 
 def save_session(data: Dict[str, Any], path: Path | None = None) -> None:
     path = path or SESSION_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
+    plain = json.dumps(data, ensure_ascii=False, indent=2)
+    sealed = _dpapi(plain.encode("utf-8"), protect=True)
+    if sealed is not None:
+        plain = json.dumps({DPAPI_KEY: base64.b64encode(sealed).decode("ascii")}, indent=2)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(plain, encoding="utf-8")
     os.replace(tmp, path)
     try:  # прибрати файл із загального доступу, наскільки дозволяє ОС
         os.chmod(path, 0o600)

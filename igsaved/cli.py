@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import notify, status
@@ -30,8 +32,34 @@ NO_SESSION_MESSAGE = (
 )
 
 
+LOG_KEEP_MONTHS = 3
+
+
+def rotate_logs(log_dir: Path = LOG_DIR, keep_months: int = LOG_KEEP_MONTHS) -> int:
+    """Прибирає місячні журнали, старші за keep_months. Повертає, скільки стерто.
+
+    Журнал sync_YYYY-MM.log ріс без обмеження — за рік це десятки мегабайт
+    тексту, який ніхто не прочитає.
+    """
+    cutoff = datetime.now() - timedelta(days=31 * keep_months)
+    removed = 0
+    for path in log_dir.glob("sync_*.log"):
+        try:
+            stamp = datetime.strptime(path.stem[len("sync_"):], "%Y-%m")
+        except ValueError:
+            continue
+        if stamp < cutoff:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def _logger(quiet: bool):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rotate_logs()
     log_file = LOG_DIR / f"sync_{datetime.now():%Y-%m}.log"
     handle = open(log_file, "a", encoding="utf-8")
 
@@ -65,6 +93,20 @@ def resolve_sessionid(cfg: Config, log) -> str:
     return ""
 
 
+def _jitter(cfg: Config, log) -> None:
+    """Випадкова пауза перед плановим проходом.
+
+    Рівно о 09:00:00 щодня — підпис планувальника; людина так не заходить.
+    Кілька хвилин розкиду коштують нічого, а рівний ритм прибирають.
+    """
+    minutes = int(cfg.schedule_jitter_minutes or 0)
+    if minutes <= 0:
+        return
+    seconds = random.uniform(0, minutes * 60)
+    log(f"Плановий прохід: чекаю {int(seconds // 60)} хв {int(seconds % 60)} с (випадковий зсув).")
+    time.sleep(seconds)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="igsaved", description="Синхронізація збережених постів Instagram у папку та Eagle."
@@ -83,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quiet", action="store_true", help="без виводу в консоль")
     parser.add_argument("--no-popup", action="store_true",
                         help="не показувати системне вікно при збої фонового запуску")
+    parser.add_argument("--no-jitter", action="store_true",
+                        help="без випадкової затримки перед плановим проходом")
     args = parser.parse_args(argv)
 
     cfg = Config.load()
@@ -131,12 +175,21 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             engine = SyncEngine(cfg, state, sessionid, log=log)
+            if source == "scheduled" and not args.no_jitter and engine.cooldown_left() <= 0:
+                _jitter(cfg, log)
             stats = engine.run(only_collections=args.collection or None)
+
+            if stats.skipped_run:
+                # Свідомий пропуск — не привід для вікна «з помилками».
+                status.write(status.SKIPPED, source=source, summary=stats.summary())
+                return 0
 
             if stats.errors:
                 status.write(
-                    status.FAILED, source=source,
+                    status.FAILED if stats.reason != "session_dead" else status.NO_SESSION,
+                    source=source,
                     summary=stats.summary(), errors=stats.errors,
+                    advice=status.NO_SESSION_ADVICE if stats.reason == "session_dead" else "",
                 )
                 if source == "scheduled" and not args.no_popup:
                     notify.popup(
@@ -146,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
 
             status.write(status.OK, source=source, summary=stats.summary())
+            if source == "scheduled" and not args.no_popup and cfg.notify_on_finish \
+                    and (stats.downloaded or stats.to_review):
+                # Безголовий прохід — єдиний спосіб дізнатись, що є на що глянути.
+                notify.popup("InstRef — синхронізацію завершено", stats.summary(), seconds=15)
             return 0
         finally:
             state.close()

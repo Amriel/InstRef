@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import json
 import sys
 import types
@@ -3249,3 +3250,213 @@ def test_cleanup_does_nothing_when_eagle_is_silent(tmp_path, monkeypatch):
         assert media.exists()
     finally:
         state.close()
+
+
+# ==========================================================================
+#  Спринт 1: міцність — замок, 429, облік невдач, бекапи, ротація логів
+# ==========================================================================
+def test_run_lock_refuses_a_second_process(tmp_path):
+    """Вікно і планувальник не мають ходити в Instagram одночасно."""
+    from igsaved.lock import LockHeld, RunLock
+
+    path = tmp_path / "sync.lock"
+    with RunLock(path):
+        assert path.exists()
+        second = RunLock(path)
+        try:
+            second.acquire()
+            raise AssertionError("другий замок не мав зайнятись")
+        except LockHeld:
+            pass
+    assert not path.exists()
+
+
+def test_stale_lock_from_a_dead_process_is_reclaimed(tmp_path):
+    """Після краху файл замка лишається — він не має блокувати назавжди."""
+    from igsaved.lock import RunLock
+
+    path = tmp_path / "sync.lock"
+    path.write_text("999999999\n")          # такого pid немає
+    with RunLock(path):
+        assert path.read_text().strip() != "999999999"
+
+
+def test_engine_skips_when_another_run_holds_the_lock(tmp_path, monkeypatch):
+    from igsaved import sync as sync_mod
+    from igsaved.lock import RunLock
+
+    engine, cfg, state = _engine(tmp_path, min_hours_between_runs=0)
+    try:
+        lock_path = tmp_path / "sync.lock"
+        monkeypatch.setattr(sync_mod, "LOCK_PATH", lock_path)
+        connected = []
+        monkeypatch.setattr(engine.ig, "connect", lambda sid: connected.append(sid))
+        with RunLock(lock_path):
+            stats = engine.run()
+        assert stats.reason == "locked" and stats.skipped_run
+        assert connected == []
+    finally:
+        state.close()
+
+
+def test_rate_limit_stops_the_whole_run_and_sets_a_forced_cooldown(tmp_path, monkeypatch):
+    """«Please wait a few minutes» — не «спробуй ще раз», а «зупинись»:
+    решта підбірок не обходиться, і 24 год застосунок не повертається."""
+    from igsaved import sync as sync_mod
+    from igsaved.instagram import CollectionInfo, RateLimited
+
+    engine, cfg, state = _engine(tmp_path, min_hours_between_runs=0,
+                                 rate_limit_cooldown_hours=24.0, eagle_enabled=False)
+    try:
+        monkeypatch.setattr(sync_mod, "LOCK_PATH", tmp_path / "sync.lock")
+        monkeypatch.setattr(engine.ig, "connect", lambda sid: "me")
+        cols = [CollectionInfo("1", "A", 0), CollectionInfo("2", "B", 0)]
+        monkeypatch.setattr(engine, "_pick_collections", lambda only: cols)
+        walked = []
+
+        def boom(pk, stop=None, on_page=None):
+            walked.append(pk)
+            raise RateLimited("Please wait a few minutes")
+
+        monkeypatch.setattr(engine.ig, "iter_media", boom)
+        stats = engine.run()
+        assert walked == ["1"]                     # другу підбірку не чіпали
+        assert stats.reason == "rate_limited"
+        assert state.cooldown_until() is not None
+        assert engine.cooldown_left() > 23.0
+
+        # і навіть примусовий ручний запуск не пробʼє паузу
+        walked.clear()
+        stats = engine.run(force=True)
+        assert stats.reason == "cooldown" and walked == []
+    finally:
+        state.close()
+
+
+def test_instagrapi_errors_are_classified():
+    from igsaved.instagram import InstagramError, RateLimited, SessionDead, classify_error
+
+    class PleaseWaitFewMinutes(Exception):
+        pass
+
+    class LoginRequired(Exception):
+        pass
+
+    assert classify_error(PleaseWaitFewMinutes("wait")) is RateLimited
+    assert classify_error(Exception("429 Client Error: Too Many Requests")) is RateLimited
+    assert classify_error(LoginRequired("login_required")) is SessionDead
+    assert classify_error(Exception("challenge_required")) is SessionDead
+    assert classify_error(Exception("connection reset")) is InstagramError
+
+
+def test_failing_post_is_given_up_after_n_attempts(tmp_path, monkeypatch):
+    """Видалений автором пост інакше повторювався б кожен прохід назавжди."""
+    from igsaved.instagram import CollectionInfo
+
+    engine, cfg, state = _engine(tmp_path, max_post_attempts=3, eagle_enabled=False)
+    try:
+        lines = []
+        engine.log = lines.append
+        col = CollectionInfo("1", "A", 0)
+        post = _post(caption="ref", username="gone", pk=777)
+        monkeypatch.setattr(engine.ig, "iter_media",
+                            lambda pk, stop=None, on_page=None: iter([post]))
+
+        def fail(media, col, verdict=None):
+            raise RuntimeError("media not found")
+
+        monkeypatch.setattr(engine, "_process_media", fail)
+        for _ in range(3):
+            engine._sync_collection(col)
+        assert engine.stats.failed == 3
+        assert state.is_known("777")                 # більше не чіпаємо
+        assert [r["pk"] for r in state.given_up()] == ["777"]
+        assert any("більше не пробую" in line for line in lines)
+
+        # четвертий прохід уже не пробує
+        engine._sync_collection(col)
+        assert engine.stats.failed == 3
+
+        # і можна повернути
+        assert state.retry_given_up() == 1
+        assert not state.is_known("777")
+    finally:
+        state.close()
+
+
+def test_success_resets_the_failure_counter(tmp_path):
+    state = State(tmp_path / "s.db")
+    try:
+        state.mark_failure("1", "x", max_attempts=3)
+        state.mark_failure("1", "x", max_attempts=3)
+        state.clear_failures("1")
+        assert state.mark_failure("1", "x", max_attempts=3) == 1
+    finally:
+        state.close()
+
+
+def test_backup_is_made_and_pruned(tmp_path):
+    from igsaved import state as state_mod
+
+    state = State(tmp_path / "s.db")
+    try:
+        state.record_media("1", "c", "u", None, 2, "clips", "", "https://x/1/", status="done")
+        made = state.backup("test")
+        assert made is not None and made.exists()
+        copy = sqlite3.connect(str(made))
+        assert copy.execute("SELECT COUNT(*) FROM media").fetchone()[0] == 1
+        copy.close()
+
+        for _ in range(state_mod.BACKUP_KEEP + 3):
+            state.backup("many")
+        assert len(list(state.backup_dir.glob("state_*.db"))) == state_mod.BACKUP_KEEP
+
+        assert state.backup_if_due() is not None
+        assert state.backup_if_due() is None          # тиждень ще не минув
+    finally:
+        state.close()
+
+
+def test_migration_backs_up_the_old_database_first(tmp_path):
+    """Міграція переписує таблиці; копія до неї — єдиний шлях назад."""
+    path = tmp_path / "s.db"
+    raw = sqlite3.connect(str(path))
+    raw.executescript(
+        "CREATE TABLE media (pk TEXT PRIMARY KEY, code TEXT, username TEXT, taken_at TEXT,"
+        " media_type INTEGER, product_type TEXT, caption TEXT, url TEXT, first_seen TEXT,"
+        " downloaded_at TEXT, status TEXT);"
+        "INSERT INTO media (pk, status) VALUES ('1', 'done');"
+    )
+    raw.commit()
+    raw.close()
+    state = State(path)
+    try:
+        assert "attempts" in state._columns("media")
+        backups = list((tmp_path / "backups").glob("state_*pre-migration.db"))
+        assert len(backups) == 1
+    finally:
+        state.close()
+
+
+def test_old_logs_are_rotated(tmp_path):
+    from igsaved.cli import rotate_logs
+
+    (tmp_path / "sync_2025-01.log").write_text("old")
+    (tmp_path / "sync_2026-08.log").write_text("recent")
+    (tmp_path / "notes.txt").write_text("keep")
+    removed = rotate_logs(tmp_path, keep_months=3)
+    assert removed == 1
+    assert not (tmp_path / "sync_2025-01.log").exists()
+    assert (tmp_path / "sync_2026-08.log").exists()
+    assert (tmp_path / "notes.txt").exists()
+
+
+def test_session_file_round_trips(tmp_path):
+    """На Windows файл шифрується DPAPI; на решті — лишається JSON. В обох
+    випадках load повертає те, що save отримав."""
+    from igsaved.config import load_session, save_session
+
+    path = tmp_path / "session.json"
+    save_session({"sessionid": "abc%3Adef", "browser": "chrome"}, path)
+    assert load_session(path) == {"sessionid": "abc%3Adef", "browser": "chrome"}
+    assert load_session(tmp_path / "missing.json") == {}
