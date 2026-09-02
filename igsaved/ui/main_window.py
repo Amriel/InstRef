@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QTime, QTimer
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
@@ -18,9 +18,6 @@ from PySide6.QtWidgets import (
     QSpinBox, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
 )
-
-EAGLE_DEFAULT_URL = "http://localhost:41595"
-LABEL_WIDTH = 168  # однакова колонка підписів на всіх сторінках налаштувань
 
 from .. import APP_NAME, __version__, status
 from ..config import (
@@ -40,12 +37,14 @@ from ..vision import (
     PLACEHOLDERS as VISION_PLACEHOLDERS,
     SAFE_FRAMES as VISION_SAFE_FRAMES,
 )
-from . import theme
 from .review_tab import ReviewTab
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
     DupeWorker, PushWorker, RefreshWorker, SyncWorker,
 )
+
+EAGLE_DEFAULT_URL = "http://localhost:41595"
+LABEL_WIDTH = 168  # однакова колонка підписів на всіх сторінках налаштувань
 
 DESCRIBE_LABEL = "Описати бібліотеку моделлю"
 

@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .config import (
-    FROZEN, SCHED_DAILY, SCHED_HOURLY, SCHED_ONLOGON, SCHED_WEEKLY, app_dir,
-    resource_dir,
+    FROZEN, SCHED_DAILY, SCHED_HOURLY, SCHED_ONLOGON, SCHED_WEEKLY, resource_dir,
 )
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0

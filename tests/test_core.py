@@ -28,7 +28,7 @@ from igsaved.naming import (  # noqa: E402
 )
 from igsaved.tagging import MediaTags, apply as apply_tags  # noqa: E402
 from igsaved import status as run_status  # noqa: E402
-from igsaved.session import CookieResult, explain, find_sessionid, normalize_sessionid  # noqa: E402
+from igsaved.session import CookieResult, explain, normalize_sessionid  # noqa: E402
 from igsaved.state import State  # noqa: E402
 
 
@@ -843,7 +843,7 @@ def test_gaming_post_goes_to_review_not_download():
     Причина була в підрядковому пошуку — «art» сидить усередині gamestart,
     spartan, parts, і цього вистачало, щоб визнати пост артом.
     """
-    from igsaved.classify import DOWNLOAD, REVIEW, classify
+    from igsaved.classify import REVIEW, classify
 
     for username in ("gamestart", "spartan_plays", "parts_gaming", "cartoonz"):
         verdict = classify(_post(caption="нове проходження, гляньте", username=username))

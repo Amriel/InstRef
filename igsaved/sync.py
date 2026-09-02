@@ -15,7 +15,7 @@ from . import frames as framegrab
 from . import taxonomy
 from . import vision
 from .classify import DOWNLOAD, REVIEW, SKIP, Rules
-from .config import ALL_POSTS_PK, Config, DEVICE_PATH, LIKED_PK, STRUCTURE_PER_COLLECTION
+from .config import Config, DEVICE_PATH, STRUCTURE_PER_COLLECTION
 from .downloader import Downloader, TooLarge, human_size
 from .eagle import EagleClient, EagleError, EagleItem
 from .instagram import (
