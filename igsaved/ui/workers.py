@@ -126,12 +126,15 @@ class DescribeWorker(QThread):
     done = Signal(object)  # DescribeStats
 
     def __init__(self, cfg: Config, state: State, limit: int = 0,
-                 redo: bool = False, parent=None):
+                 redo: bool = False, only_stale: bool = False,
+                 model_override: str = "", parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self.state = state
         self.limit = limit
         self.redo = redo
+        self.only_stale = only_stale
+        self.model_override = model_override
         self._stop = False
 
     def stop(self) -> None:
@@ -142,7 +145,30 @@ class DescribeWorker(QThread):
 
         self.done.emit(describe_library(
             self.cfg, self.state, log=self.line.emit,
-            should_stop=lambda: self._stop, limit=self.limit, redo=self.redo))
+            should_stop=lambda: self._stop, limit=self.limit, redo=self.redo,
+            only_stale=self.only_stale, model_override=self.model_override))
+
+
+class NormalizeWorker(QThread):
+    """Ретро-нормалізація тегів за словником — база й Eagle, без моделі."""
+
+    line = Signal(str)
+    done = Signal(object)  # NormalizeStats
+
+    def __init__(self, cfg: Config, state: State, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.state = state
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        from ..maintenance import normalize_library
+
+        self.done.emit(normalize_library(
+            self.cfg, self.state, log=self.line.emit, should_stop=lambda: self._stop))
 
 
 class DupeWorker(QThread):

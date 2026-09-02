@@ -169,6 +169,12 @@ class Config:
     # Eagle асинхронне). Типово вимкнено: видалення вмикають свідомо.
     eagle_delete_local_after_import: bool = False
     eagle_import_thumbnails: bool = False
+    # Репост того самого ролика в іншому акаунті — інший pk і інший хеш
+    # файлу, але ті самі кадри. Перцептивний відбиток це ловить; що робити:
+    # review — показати в перегляді з підказкою; import — імпортувати як є;
+    # skip — не брати.
+    dupe_action: str = "review"
+    dupe_max_distance: int = 8
     eagle_tags_from_hashtags: bool = True
     eagle_tag_collection: bool = True
     eagle_tag_author: bool = True
@@ -219,6 +225,18 @@ class Config:
     # а обкладинка reels — це часто чорний кадр або титр, за яким про ролик
     # нічого не скажеш.
     vision_frames: int = 6
+    # Кадрів від тривалості: приблизно один на стільки секунд, але не менше
+    # vision_frames і не більше стелі. 0 = завжди рівно vision_frames.
+    vision_seconds_per_frame: float = 5.0
+    # Брати кадри за монтажними склейками (і минати чорні), а не рівними
+    # кроками: рівний крок у ролику з жорстким монтажем влучає в переходи.
+    vision_frames_by_scene: bool = True
+    # Після планового проходу описати ще стільки елементів бібліотеки Eagle,
+    # яким опису бракує — покриття росте само. 0 = вимкнено.
+    describe_backlog_per_run: int = 10
+    # pk підбірок, для яких описи не потрібні (модель не витрачає хвилину на
+    # ролик, який і так зрозумілий за назвою підбірки).
+    describe_skip_collections: List[str] = field(default_factory=list)
     # Порожньо = вбудована інструкція (vision.DEFAULT_PROMPT). Зберігаємо саме
     # порожній рядок, щоб оновлення застосунку могло покращити типову
     # інструкцію тим, хто її не редагував.

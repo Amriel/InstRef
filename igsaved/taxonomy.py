@@ -253,6 +253,19 @@ DEFAULT_ALIASES: Dict[str, str] = {
     "pov": "point-of-view",
     "ots": "over-the-shoulder",
     "birds-eye": "overhead",
+    # Промахи, які модель робила раз за разом на реальній бібліотеці.
+    "backlight": "backlit",
+    "backlighting": "backlit",
+    "photography": "photograph",
+    "photo": "photograph",
+    "motiongraphics": "motion-graphics",
+    "motion-graphic": "motion-graphics",
+    "mograph": "motion-graphics",
+    "blackandwhite": "black-and-white",
+    "black-white": "black-and-white",
+    "minimalist": "minimalist-composition",
+    "minimal": "minimalist-composition",
+    "minimalism": "minimalist-composition",
 }
 
 
@@ -407,10 +420,14 @@ class Taxonomy:
             ))
         if not categories:
             raise ValueError("у словнику немає жодної категорії")
-        aliases = {
+        # Вбудовані синоніми — підкладка під файл: нові промахи, які ми
+        # навчились мапити, мають діяти і в тих, хто зберіг словник раніше.
+        # Свій запис у файлі має перевагу.
+        aliases = dict(DEFAULT_ALIASES)
+        aliases.update({
             clean_token(k): clean_token(v)
             for k, v in (data.get("aliases") or {}).items()
-        }
+        })
         exclusive = [[clean_token(t) for t in group]
                      for group in (data.get("exclusive") or [])]
         return cls(categories, aliases, exclusive)

@@ -541,6 +541,8 @@ def describe_library(
     should_stop: Callable[[], bool] = lambda: False,
     limit: int = 0,
     redo: bool = False,
+    only_stale: bool = False,
+    model_override: str = "",
 ) -> DescribeStats:
     """Дописує опис і теги до того, що вже лежить у Eagle.
 
@@ -548,6 +550,11 @@ def describe_library(
     здебільшого зібрана раніше — та ще й після чистки папки завантажень самі
     файли лишились тільки всередині Eagle. Тому й джерелом кадрів тут виступає
     бібліотека, а не диск.
+
+    redo — переписати й уже описане; only_stale — переписати лише те, що
+    описано іншою інструкцією чи моделлю (за prompt_hash у базі);
+    model_override — інша модель LM Studio, ніж у налаштуваннях (переопис
+    сильнішою моделлю).
     """
     from . import frames as framegrab
     from . import taxonomy
@@ -561,6 +568,8 @@ def describe_library(
         return stats
 
     client = vision.client_for(cfg)
+    if model_override:
+        client.model = model_override.strip()
     try:
         model = client.resolve_model()
     except vision.VisionError as exc:
@@ -592,9 +601,14 @@ def describe_library(
     except EagleError:
         folders = None
 
-    want = max(1, min(vision.MAX_FRAMES, int(cfg.vision_frames or 1)))
+    base = max(1, min(vision.MAX_FRAMES, int(cfg.vision_frames or 1)))
     stems = state.files_by_stem()
     urls = state.media_by_url()
+    current_hash = vision.prompt_hash(cfg.vision_prompt, model)
+    examples = state.exemplars()
+    missing_ids = set(state.without_eagle_item_id())
+    skip_pks = _pks_in_collections(state, cfg.describe_skip_collections)
+    per = float(cfg.vision_seconds_per_frame or 0)
 
     log("Читаю бібліотеку Eagle…")
     for item in eagle.iter_items(folders):
@@ -606,8 +620,24 @@ def describe_library(
             break
         stats.seen += 1
 
+        name = str(item.get("name") or "")
+        known = stems.get(name) or _by_url(urls, item.get("url"))
+        item_id = str(item.get("id") or "")
+        if known and item_id and known[0] in missing_ids:
+            state.set_eagle_item_id(known[0], item_id)
+            missing_ids.discard(known[0])
+
         annotation = str(item.get("annotation") or "")
-        if not redo and any(mark in annotation for mark in DESCRIPTION_MARKS):
+        described_before = any(mark in annotation for mark in DESCRIPTION_MARKS)
+        if described_before and not redo:
+            stale = False
+            if only_stale and known:
+                meta = state.ai_meta(known[0], known[1]) or {}
+                stale = bool(meta) and meta.get("prompt_hash", "") != current_hash
+            if not stale:
+                stats.already += 1
+                continue
+        if known and known[0] in skip_pks:
             stats.already += 1
             continue
 
@@ -616,16 +646,31 @@ def describe_library(
             stats.missing += 1
             continue
 
-        shots = framegrab.shots_from_file(Path(path), want)
+        want = base
+        if Path(path).suffix.lower() in framegrab.VIDEO_EXT:
+            if per > 0:
+                want = framegrab.frame_budget(framegrab.video_duration(Path(path)),
+                                              base, vision.MAX_FRAMES, per)
+            shots = framegrab.extract(Path(path), want, by_scene=cfg.vision_frames_by_scene)
+        else:
+            shots = framegrab.shots_from_file(Path(path), want)
         if not shots:
             stats.missing += 1
             continue
 
-        name = str(item.get("name") or Path(path).stem)
+        # Відбитки для пошуку репостів — заодно, поки файл під рукою.
+        if known and not state.has_fingerprints(known[0]):
+            prints = framegrab.fingerprint(Path(path))
+            if prints:
+                state.set_fingerprints(known[0], known[1], prints)
+
+        name = name or Path(path).stem
         mode = taxonomy.mode_for(path)
-        answer = client.classify(shots, caption=annotation[:400],
+        answer = client.classify(shots, caption=_strip_description(annotation)[:400],
                                  kind="reel" if mode == taxonomy.VIDEO else "photo",
-                                 mode=mode)
+                                 mode=mode,
+                                 collections=state.collection_names_for(known[0]) if known else None,
+                                 examples=examples)
         if answer.dropped:
             state.note_tag_candidates(answer.dropped)
         if answer.error and not answer.has_text:
@@ -637,7 +682,13 @@ def describe_library(
             log(f"   ⤼ {name[:50]}: модель нічого не написала")
             continue
 
-        tags = list(item.get("tags") or []) + list(answer.tags)
+        old_ai = set()
+        if known and (redo or only_stale):
+            # Переопис: старі теги моделі прибираємо, ручні теги власника лишаються.
+            previous = state.ai_meta(known[0], known[1]) or {}
+            old_ai = {str(t).lower() for t in previous.get("tags", [])}
+        tags = [t for t in (item.get("tags") or []) if str(t).lower() not in old_ai] \
+            + list(answer.tags)
         seen_tags, unique = set(), []
         for tag in tags:
             key = str(tag).strip().lower()
@@ -649,7 +700,8 @@ def describe_library(
                 str(item.get("id")),
                 tags=unique,
                 annotation=tagging.annotation(
-                    _strip_description(annotation), answer.description),
+                    _strip_description(annotation), answer.description,
+                    answer.on_screen_text),
             )
         except EagleError as exc:
             stats.failed += 1
@@ -661,12 +713,12 @@ def describe_library(
 
         # Якщо пост відомий базі — лишаємо опис і в себе, щоб він потрапляв
         # у майбутні файли й не питався вдруге.
-        known = stems.get(name) or _by_url(urls, item.get("url"))
         if known:
             pk, idx = known
             state.set_ai_meta(pk, answer.category if answer.ok else "",
                               answer.confidence, answer.description, answer.tags,
-                              model, answer.frames, idx=idx)
+                              model, answer.frames, idx=idx, prompt_hash=current_hash,
+                              screen_text=answer.on_screen_text)
 
     log(f"Готово: {stats.summary()}")
     return stats
@@ -812,12 +864,190 @@ def _by_url(urls: Dict[str, str], url) -> Optional[tuple]:
 
 
 def _strip_description(annotation: str) -> str:
-    """Прибирає наш попередній опис, щоб повторний прохід не наростив хвіст."""
-    for candidate in DESCRIPTION_MARKS:
+    """Прибирає наш попередній опис (і текст з екрана), щоб повторний прохід
+    не наростив хвіст."""
+    for candidate in (*DESCRIPTION_MARKS, tagging.SCREEN_LABEL):
         head, mark, _ = annotation.partition(f"\n\n{candidate}")
         if mark:
-            return head
+            annotation = head
     return annotation
+
+
+def _pks_in_collections(state: State, collection_pks) -> set:
+    """Пости з підбірок, для яких описи не потрібні."""
+    wanted = {str(pk) for pk in (collection_pks or []) if str(pk)}
+    if not wanted:
+        return set()
+    with state._lock:  # noqa: SLF001
+        rows = state.db.execute(
+            f"SELECT DISTINCT media_pk FROM membership WHERE collection_pk IN "
+            f"({','.join('?' for _ in wanted)})", tuple(wanted),
+        ).fetchall()
+    return {str(r["media_pk"]) for r in rows}
+
+
+# ------------------------------------------- ретро-нормалізація тегів
+@dataclass
+class NormalizeStats:
+    rows: int = 0
+    changed: int = 0
+    eagle_updated: int = 0
+    eagle_missing: int = 0
+    failed: int = 0
+    error: str = ""
+
+    def summary(self) -> str:
+        if self.error:
+            return self.error
+        return (
+            f"записів {self.rows}, змінено {self.changed}, "
+            f"оновлено в Eagle {self.eagle_updated}"
+            + (f", не знайдено в Eagle {self.eagle_missing}" if self.eagle_missing else "")
+            + (f", помилок {self.failed}" if self.failed else "")
+        )
+
+
+def normalize_library(
+    cfg: Config,
+    state: State,
+    log: Callable[[str], None] = print,
+    should_stop: Callable[[], bool] = lambda: False,
+    update_eagle: bool = True,
+) -> NormalizeStats:
+    """Проганяє збережені теги моделі через поточний словник і виправляє
+    вже імпортовані елементи Eagle — без жодного запиту до моделі.
+
+    Перші описи зроблено до появи словника: їхні теги («cinematic», «render»,
+    «3d») уже в бібліотеці й нічого не знаходять. Словник із того часу виріс
+    синонімами — і застосувати його заднім числом дешевше, ніж переописувати.
+    """
+    from . import taxonomy as taxonomy_mod
+    from .eagle import EagleClient, EagleError
+
+    stats = NormalizeStats()
+    tax = taxonomy_mod.Taxonomy.load()
+    changes: Dict[tuple, tuple] = {}     # (pk, idx) → (старі, нові)
+
+    for row in state.ai_meta_rows():
+        if should_stop():
+            break
+        stats.rows += 1
+        old = [t for t in (row["tags"] or "").split("\n") if t]
+        if not old:
+            continue
+        mode = taxonomy_mod.VIDEO
+        pk, idx = str(row["media_pk"]), int(row["idx"] or 0)
+        files = state.media_files(pk)
+        if files:
+            target = files[min(max(idx - 1, 0), len(files) - 1)] if idx else files[0]
+            mode = taxonomy_mod.mode_for(target)
+        new, _dropped = tax.normalize(old, mode)
+        if [t.lower() for t in old] == [t.lower() for t in new]:
+            continue
+        stats.changed += 1
+        state.update_ai_tags(pk, idx, new)
+        changes[(pk, idx)] = (old, new)
+        log(f"   {pk}/{idx}: {len(old)} → {len(new)} тег(ів)")
+
+    if not update_eagle or not changes:
+        log(f"Готово: {stats.summary()}")
+        return stats
+
+    client = EagleClient(cfg.eagle_url, cfg.eagle_token)
+    try:
+        client.ping()
+    except EagleError as exc:
+        stats.error = f"Теги в базі виправлено, але Eagle недоступний: {exc}"
+        log(stats.error)
+        return stats
+
+    # Елементи Eagle знаходимо за збереженим id, а без нього — за адресою поста.
+    ids = state.eagle_item_ids()
+    need_lookup = {pk for (pk, _idx) in changes if pk not in ids}
+    by_url: Dict[str, List[dict]] = {}
+    if need_lookup:
+        urls = state.media_by_url()
+        wanted_urls = {url for url, pk in urls.items() if pk in need_lookup}
+        try:
+            for item in client.iter_items(_our_folder_ids(client, cfg, log)):
+                url = str(item.get("url") or "").rstrip("/")
+                if url in wanted_urls:
+                    by_url.setdefault(url, []).append(item)
+        except EagleError as exc:
+            stats.error = f"Eagle не віддав список: {exc}"
+            log(stats.error)
+            return stats
+    urls_by_pk = {pk: url for url, pk in state.media_by_url().items()}
+
+    for (pk, idx), (old, new) in changes.items():
+        if should_stop():
+            break
+        items: List[dict] = []
+        if pk in ids:
+            try:
+                fetched = client.get_item(ids[pk])
+            except EagleError:
+                fetched = None
+            if fetched:
+                items = [fetched]
+        if not items:
+            items = by_url.get(urls_by_pk.get(pk, ""), [])
+        if not items:
+            stats.eagle_missing += 1
+            continue
+        drop = {t.lower() for t in old}
+        for item in items:
+            current = [t for t in (item.get("tags") or []) if str(t).lower() not in drop]
+            merged, seen = [], set()
+            for tag in current + list(new):
+                key = str(tag).lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(str(tag))
+            try:
+                client.update_item(str(item.get("id")), tags=merged)
+                stats.eagle_updated += 1
+            except EagleError as exc:
+                stats.failed += 1
+                log(f"   ✖ {pk}: Eagle не прийняв — {exc}")
+
+    log(f"Готово: {stats.summary()}")
+    return stats
+
+
+# ------------------------------------------------------ звіт про словник
+def vocabulary_report(state: State, top: int = 15) -> str:
+    """Які теги перевикористані (>40% описів), а які мертві (0 ужитків)."""
+    from . import taxonomy as taxonomy_mod
+
+    tax = taxonomy_mod.Taxonomy.load()
+    rows = state.ai_meta_rows()
+    total = 0
+    counts: Dict[str, int] = {}
+    for row in rows:
+        tags = [t for t in (row["tags"] or "").split("\n") if t and t != taxonomy_mod.MARKER]
+        if not tags:
+            continue
+        total += 1
+        for tag in set(tags):
+            counts[tag] = counts.get(tag, 0) + 1
+    if not total:
+        return "Описів із тегами ще немає — звітувати нема про що."
+    lines = [f"Описів із тегами: {total}. Тегів у словнику: {len(set(tax.all_tags()))}.", ""]
+    overused = [(t, c) for t, c in counts.items() if c / total > 0.4]
+    overused.sort(key=lambda x: -x[1])
+    lines.append("Перевикористані (у понад 40% описів — такі нічого не знаходять):")
+    lines.extend(f"   {t}: {c} ({100 * c // total}%)" for t, c in overused[:top]) if overused \
+        else lines.append("   немає")
+    used = set(counts)
+    dead = [t for t in tax.all_tags() if t not in used]
+    lines.append("")
+    lines.append(f"Мертві (жодного вжитку): {len(dead)}")
+    lines.append("   " + ", ".join(sorted(dead)[:60]) + (" …" if len(dead) > 60 else ""))
+    lines.append("")
+    lines.append("Найчастіші:")
+    lines.extend(f"   {t}: {c}" for t, c in sorted(counts.items(), key=lambda x: -x[1])[:top])
+    return "\n".join(lines)
 
 
 def push_media(cfg: Config, state: State, media_pk: str,

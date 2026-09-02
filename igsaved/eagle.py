@@ -196,6 +196,11 @@ class EagleClient:
                 return
             offset += page
 
+    def get_item(self, item_id: str) -> Optional[dict]:
+        """Один елемент за id — коли id відомий, повний список не потрібен."""
+        data = self._get("item/info", {"id": str(item_id)})
+        return data if isinstance(data, dict) and data.get("id") else None
+
     def update_item(self, item_id: str, tags: Optional[List[str]] = None,
                     annotation: Optional[str] = None, url: str = "") -> None:
         """Дописує нотатку й теги до вже наявного елемента."""

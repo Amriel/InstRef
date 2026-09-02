@@ -40,7 +40,7 @@ from ..vision import (
 from .review_tab import ReviewTab
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
-    DupeWorker, PushWorker, RefreshWorker, SyncWorker,
+    DupeWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
 )
 
 EAGLE_DEFAULT_URL = "http://localhost:41595"
@@ -200,6 +200,7 @@ class MainWindow(QMainWindow):
         self.push_worker: Optional[PushWorker] = None
         self.cleanup_worker: Optional[CleanupWorker] = None
         self.describe_worker: Optional[DescribeWorker] = None
+        self.normalize_worker: Optional[NormalizeWorker] = None
         self.dupe_worker: Optional[DupeWorker] = None
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
@@ -338,8 +339,13 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Vertical)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "Підбірка", "В Instagram", "Завантажено"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Підбірка", "В Instagram", "Завантажено", "Опис"])
+        self.table.setToolTip(
+            "Перша галочка — синхронізувати підбірку; «Опис» — чи показувати її "
+            "пости моделі заради опису й тегів."
+        )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -348,7 +354,10 @@ class MainWindow(QMainWindow):
         head.setSectionResizeMode(1, QHeaderView.Stretch)
         head.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         head.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        head.setSectionResizeMode(4, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 36)
+        self.table.setColumnWidth(4, 52)
+        self.table.itemChanged.connect(self._on_table_item_changed)
         splitter.addWidget(self.table)
 
         log_box = QWidget()
@@ -723,6 +732,36 @@ class MainWindow(QMainWindow):
             "часто чорний кадр або титр, тому один кадр давав найбільше помилок. "
             "Каруселі модель бачить по слайдах."))
 
+        self.sp_sec_per_frame = QDoubleSpinBox()
+        self.sp_sec_per_frame.setRange(0.0, 60.0)
+        self.sp_sec_per_frame.setDecimals(0)
+        self.sp_sec_per_frame.setSuffix(" с на кадр")
+        self.sp_sec_per_frame.setSpecialValueText("завжди стільки, як вище")
+        self.sp_sec_per_frame.setFixedWidth(185)
+        form.addRow(_flabel("Кадрів від тривалості"), _row(_left(self.sp_sec_per_frame)))
+        form.addRow(_flabel(""), _hint(
+            "Приблизно один кадр на стільки секунд ролика — але не менше, ніж "
+            "вище, і не більше стелі. Десятисекундний reel і трихвилинний "
+            "туторіал не заслуговують однакової кількості кадрів."))
+
+        self.ck_by_scene = QCheckBox("Брати кадри за зміною сцени, минаючи чорні")
+        self.ck_by_scene.setToolTip(
+            "Замість рівних кроків — середина кожної монтажної сцени.\n"
+            "У ролику з жорстким монтажем рівний крок влучає в переходи."
+        )
+        form.addRow(_flabel(""), self.ck_by_scene)
+
+        self.sp_backlog = QSpinBox()
+        self.sp_backlog.setRange(0, 500)
+        self.sp_backlog.setSpecialValueText("вимкнено")
+        self.sp_backlog.setSuffix(" елементів")
+        self.sp_backlog.setFixedWidth(185)
+        form.addRow(_flabel("Дописувати після проходу"), _row(_left(self.sp_backlog)))
+        form.addRow(_flabel(""), _hint(
+            "Після кожної синхронізації описати ще стільки елементів бібліотеки "
+            "Eagle, яким опису бракує. Десяток за прохід непомітний, а за місяць "
+            "планових проходів покриває стару бібліотеку."))
+
         self.ck_vision_describe = QCheckBox("Писати опис і теги для кожного нового поста")
         self.ck_vision_describe.setToolTip(
             "Не лише для сумнівних: модель подивиться кожне нове завантаження."
@@ -875,6 +914,28 @@ class MainWindow(QMainWindow):
             "Щойно відправлене чекає до наступного проходу — копіювання на боці "
             "Eagle асинхронне, і поспішати з видаленням не можна. Черга перегляду "
             "не чіпається ніколи."))
+
+        self.cb_dupe = QComboBox()
+        for key, label in (("review", "показати в перегляді"),
+                           ("import", "імпортувати як є"),
+                           ("skip", "не брати"),
+                           ("off", "не перевіряти")):
+            self.cb_dupe.addItem(label, key)
+        self.cb_dupe.setFixedWidth(200)
+        self.sp_dupe_dist = QSpinBox()
+        self.sp_dupe_dist.setRange(0, 20)
+        self.sp_dupe_dist.setFixedWidth(70)
+        dupe_row = QHBoxLayout()
+        dupe_row.addWidget(self.cb_dupe)
+        dupe_row.addWidget(QLabel("поріг"))
+        dupe_row.addWidget(self.sp_dupe_dist)
+        dupe_row.addStretch(1)
+        form.addRow(_flabel("Схоже на наявне"), _row(dupe_row))
+        form.addRow(_flabel(""), _hint(
+            "Репост того самого ролика в іншому акаунті — інший пост і інший файл, "
+            "але ті самі кадри. Відбиток кадрів це ловить; поріг — скільки бітів "
+            "із 64 можуть відрізнятись (8 — упевнений збіг, 12 — і перекодоване "
+            "з водяним знаком)."))
 
         self.ck_eagle_per_col = QCheckBox("Підпапка на кожну підбірку")
         form.addRow(_flabel(""), self.ck_eagle_per_col)
@@ -1032,6 +1093,15 @@ class MainWindow(QMainWindow):
             "Спершу лише показує; видаляти чи ні — вирішуєш ти."
         )
         self.btn_dupes.clicked.connect(self.on_find_dupes)
+        self.btn_normalize = QPushButton("Вирівняти теги за словником")
+        self.btn_normalize.setToolTip(
+            "Проганяє збережені теги моделі через поточний словник і виправляє\n"
+            "вже імпортовані елементи Eagle. Без запитів до моделі."
+        )
+        self.btn_normalize.clicked.connect(self.on_normalize_tags)
+        self.btn_vocab = QPushButton("Звіт про словник тегів")
+        self.btn_vocab.setToolTip("Перевикористані й мертві теги — де словник не працює")
+        self.btn_vocab.clicked.connect(self.on_vocab_report)
         self.btn_given_up = QPushButton("Пости, від яких відмовились")
         self.btn_given_up.setToolTip(
             "Пости, які не вдалось узяти після кількох спроб.\n"
@@ -1059,7 +1129,8 @@ class MainWindow(QMainWindow):
         actions = QVBoxLayout()
         actions.setSpacing(6)
         for widget in (self.btn_refresh_library, self.btn_push_eagle, self.btn_describe,
-                       self.btn_dupes, self.btn_given_up, self.btn_shortcut,
+                       self.btn_dupes, self.btn_normalize, self.btn_vocab,
+                       self.btn_given_up, self.btn_shortcut,
                        self.btn_clear_downloads, self.btn_forget_downloads,
                        self.btn_reset_settings):
             widget.setMinimumHeight(34)
@@ -1174,6 +1245,12 @@ class MainWindow(QMainWindow):
         self.ck_vision_describe.setChecked(cfg.vision_describe_downloads)
         self.ck_model_glance.setChecked(cfg.model_needs_glance)
         self.ck_taxonomy.setChecked(cfg.taxonomy_enabled)
+        self.sp_sec_per_frame.setValue(cfg.vision_seconds_per_frame)
+        self.ck_by_scene.setChecked(cfg.vision_frames_by_scene)
+        self.sp_backlog.setValue(cfg.describe_backlog_per_run)
+        index = self.cb_dupe.findData(cfg.dupe_action or "review")
+        self.cb_dupe.setCurrentIndex(index if index >= 0 else 0)
+        self.sp_dupe_dist.setValue(cfg.dupe_max_distance)
         self.sp_suggest_after.setValue(max(1, cfg.taxonomy_suggest_after))
         # Порожньо в конфізі = типова інструкція; у полі показуємо саме її,
         # щоб було що читати й правити.
@@ -1263,6 +1340,11 @@ class MainWindow(QMainWindow):
         cfg.vision_describe_downloads = self.ck_vision_describe.isChecked()
         cfg.model_needs_glance = self.ck_model_glance.isChecked()
         cfg.taxonomy_enabled = self.ck_taxonomy.isChecked()
+        cfg.vision_seconds_per_frame = self.sp_sec_per_frame.value()
+        cfg.vision_frames_by_scene = self.ck_by_scene.isChecked()
+        cfg.describe_backlog_per_run = self.sp_backlog.value()
+        cfg.dupe_action = str(self.cb_dupe.currentData() or "review")
+        cfg.dupe_max_distance = self.sp_dupe_dist.value()
         cfg.taxonomy_suggest_after = self.sp_suggest_after.value()
         prompt = self.ed_vision_prompt.toPlainText().strip()
         # Незмінену інструкцію зберігаємо як порожню: тоді наступна версія
@@ -1684,14 +1766,30 @@ class MainWindow(QMainWindow):
         )
         first = box.addButton("Спробувати на 20", QMessageBox.AcceptRole)
         everything = box.addButton("Описати все", QMessageBox.AcceptRole)
+        stale = box.addButton("Переписати застарілі", QMessageBox.AcceptRole)
+        stale.setToolTip("Лише те, що описано іншою інструкцією чи моделлю")
+        other = box.addButton("Іншою моделлю…", QMessageBox.AcceptRole)
+        other.setToolTip("Переописати все сильнішою моделлю з LM Studio")
         box.addButton("Скасувати", QMessageBox.RejectRole)
         box.setDefaultButton(first)
         box.exec()
 
         clicked = box.clickedButton()
-        if clicked not in (first, everything):
+        if clicked not in (first, everything, stale, other):
             return
         limit = 20 if clicked is first else 0
+        only_stale = clicked is stale
+        redo = False
+        model_override = ""
+        if clicked is other:
+            from PySide6.QtWidgets import QInputDialog
+            model_override, ok = QInputDialog.getText(
+                self, APP_NAME,
+                "Назва моделі в LM Studio (має бути завантажена):",
+                text=self.cfg.vision_model or "")
+            if not ok or not model_override.strip():
+                return
+            redo = True
 
         self.tabs.setCurrentIndex(0)
         self.btn_describe.setText("Зупинити опис")
@@ -1699,7 +1797,9 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("Описую бібліотеку…")
         self._log("═══ Опис бібліотеки ═══")
 
-        self.describe_worker = DescribeWorker(self.cfg, self.state, limit=limit, parent=self)
+        self.describe_worker = DescribeWorker(
+            self.cfg, self.state, limit=limit, redo=redo, only_stale=only_stale,
+            model_override=model_override.strip(), parent=self)
         self.describe_worker.line.connect(self._log)
         self.describe_worker.done.connect(self._on_describe_done)
         self.describe_worker.start()
@@ -1712,6 +1812,38 @@ class MainWindow(QMainWindow):
         self.progress_label.setText(stats.summary())
         self._log(f"═══ {stats.summary()} ═══")
         self._notify(f"{APP_NAME}: опис бібліотеки", stats.summary())
+
+    def on_normalize_tags(self) -> None:
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            "Прогнати всі збережені теги моделі через поточний словник і "
+            "виправити елементи Eagle?\n\nТеги, яких у словнику немає, буде "
+            "прибрано; синоніми — зведено. Ручні теги, яких модель не ставила, "
+            "не чіпаються. Моделі це не потребує.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._collect_ui_into_config()
+        self.cfg.save()
+        self.tabs.setCurrentIndex(0)
+        self._log("═══ Вирівнювання тегів за словником ═══")
+        self.normalize_worker = NormalizeWorker(self.cfg, self.state, parent=self)
+        self.normalize_worker.line.connect(self._log)
+        self.normalize_worker.done.connect(
+            lambda stats: self._log(f"═══ {stats.summary()} ═══"))
+        self.normalize_worker.start()
+
+    def on_vocab_report(self) -> None:
+        from ..maintenance import vocabulary_report
+
+        text = vocabulary_report(self.state)
+        box = QMessageBox(self)
+        box.setWindowTitle("Словник тегів")
+        box.setText("Як працює словник на твоїй бібліотеці")
+        box.setDetailedText(text)
+        box.setInformativeText(text.split("\n")[0])
+        box.exec()
 
     def on_given_up(self) -> None:
         rows = self.state.given_up()
@@ -2004,6 +2136,13 @@ class MainWindow(QMainWindow):
 
     def _fill_table(self) -> None:
         enabled = set(self.cfg.enabled_collections)
+        self.table.blockSignals(True)
+        try:
+            self._fill_table_rows(enabled)
+        finally:
+            self.table.blockSignals(False)
+
+    def _fill_table_rows(self, enabled: set) -> None:
         self.table.setRowCount(len(self.collections))
         for row, col in enumerate(self.collections):
             check = QTableWidgetItem()
@@ -2027,6 +2166,29 @@ class MainWindow(QMainWindow):
             done = QTableWidgetItem(str(self.state.collection_downloaded_count(col.pk)))
             done.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 3, done)
+
+            describe = QTableWidgetItem()
+            describe.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            describe.setCheckState(
+                Qt.Unchecked if col.pk in set(self.cfg.describe_skip_collections) else Qt.Checked)
+            describe.setData(Qt.UserRole, col.pk)
+            describe.setTextAlignment(Qt.AlignCenter)
+            describe.setToolTip("Описувати пости цієї підбірки моделлю")
+            self.table.setItem(row, 4, describe)
+
+    def _on_table_item_changed(self, item) -> None:
+        """Галочка «Опис» пишеться в конфіг одразу — окремої кнопки для неї немає."""
+        if item.column() != 4:
+            return
+        pk = str(item.data(Qt.UserRole) or "")
+        if not pk:
+            return
+        skip = [p for p in self.cfg.describe_skip_collections if p != pk]
+        if item.checkState() != Qt.Checked:
+            skip.append(pk)
+        if skip != list(self.cfg.describe_skip_collections):
+            self.cfg.describe_skip_collections = skip
+            self.cfg.save()
 
     def _checked_pks(self) -> List[str]:
         result = []

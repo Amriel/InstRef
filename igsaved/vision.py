@@ -15,6 +15,7 @@ LM Studio піднімає OpenAI-сумісний сервер (типово ht
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -79,6 +80,7 @@ PLACEHOLDERS = {
     "{kind}": "reel / video / carousel / photo",
     "{mode}": "VIDEO або IMAGE",
     "{taxonomy}": "списки дозволених тегів зі словника",
+    "{examples}": "зразки описів, які ти схвалив у перегляді",
 }
 
 DEFAULT_PROMPT = """You are tagging a visual reference library for a 3D generalist and
@@ -91,7 +93,7 @@ Media mode: {mode}.
 
 CORE PRINCIPLE: precision over coverage. A wrong tag is worse than a missing one.
 
-Return four things.
+Return five things.
 
 1. CATEGORY — exactly one of: meme, art, ad, game, other.
    - meme: humour, joke, funny clip, reaction, entertainment
@@ -115,7 +117,12 @@ Return four things.
      not "A man walks…".
    - If techniques are mixed (live-action plus a CGI element), name both.
 
-4. TAGS — pick ONLY from the lists below, word for word. Anything not in a list
+4. ON_SCREEN_TEXT — any readable text burned into the frames: captions,
+   step titles, software or plugin names, settings, brand names, watermarks.
+   Quote it as written, joined with " | ". Empty string if there is none.
+   Do not include the Instagram caption here — only text visible in the frames.
+
+5. TAGS — pick ONLY from the lists below, word for word. Anything not in a list
    is discarded, so inventing tags loses information.
    - Every tag lowercase, hyphens instead of spaces, no "#".
    - Pick a tag only if a specific frame proves it. Skip a whole category when
@@ -129,11 +136,61 @@ Return four things.
 
 ALLOWED TAGS
 {taxonomy}
-
+{examples}
 Answer with JSON only, nothing around it:
 {"category": "<meme|art|ad|game|other>", "confidence": <0.0-1.0>,
  "description": "<one paragraph, English, under 80 words>",
+ "on_screen_text": "<text visible in frames, or empty string>",
  "tags": ["tag", "tag"], "why": "<max 8 words, English>"}"""
+
+EXAMPLES_HEADER = (
+    "EXAMPLES of descriptions the owner approved — match their register, "
+    "length and level of detail (do not copy their content):"
+)
+MAX_EXAMPLES = 3
+
+# Підказка про підбірку. Пост із «Houdini» чи «Tut» — це туторіал, і описувати
+# його треба як туторіал: яку техніку показано, а не яка картинка.
+TUTORIAL_MARKS = ("tut", "tutorial", "howto", "how-to", "lesson", "breakdown",
+                  "houdini", "blender", "c4d", "cinema4d", "unreal", "nuke",
+                  "substance", "zbrush", "maya", "after-effects", "ae ")
+
+
+def prompt_hash(template: str, model: str = "") -> str:
+    """Короткий відбиток інструкції й моделі.
+
+    Зберігається поруч з описом: після зміни інструкції інакше не дізнатись,
+    які описи написані старою, а які — новою.
+    """
+    text = (template or "").strip() or DEFAULT_PROMPT
+    digest = hashlib.sha1((text + "\n" + (model or "")).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def render_examples(examples) -> str:
+    lines = []
+    for item in list(examples or [])[:MAX_EXAMPLES]:
+        text = " ".join(str(item or "").split())
+        if text:
+            lines.append(f'- "{text[:400]}"')
+    if not lines:
+        return ""
+    return "\n" + EXAMPLES_HEADER + "\n" + "\n".join(lines) + "\n"
+
+
+def collection_hint(collections) -> str:
+    """Рядок контексту про підбірку(и), у яких лежить пост."""
+    names = [str(c).strip() for c in (collections or []) if str(c).strip()]
+    if not names:
+        return ""
+    joined = ", ".join(names[:4])
+    lowered = joined.lower()
+    hint = f"Saved by the owner in collection: {joined}."
+    if any(mark in lowered for mark in TUTORIAL_MARKS):
+        hint += (" This is likely a tutorial or breakdown: describe WHICH technique "
+                 "or workflow is being shown, step by step where visible, not just "
+                 "what the picture looks like.")
+    return hint
 
 # Стара однокадрова інструкція лишається під рукою: за нею писані відповіді
 # без опису й тегів, і вона ж — запасний варіант для дуже дрібних моделей.
@@ -141,7 +198,7 @@ PROMPT = DEFAULT_PROMPT
 
 
 def build_prompt(template: str, frames: int, kind: str, mode: str = "video",
-                 taxonomy=None) -> str:
+                 taxonomy=None, examples=None) -> str:
     text = (template or "").strip() or DEFAULT_PROMPT
     if taxonomy is not None and "{taxonomy}" in text:
         text = text.replace("{taxonomy}", taxonomy.render(mode))
@@ -149,6 +206,7 @@ def build_prompt(template: str, frames: int, kind: str, mode: str = "video",
         # Своя інструкція без плейсхолдера — теги все одно перевіряються кодом,
         # просто модель не побачить списків і промахуватиметься частіше.
         text = text.replace("{taxonomy}", "")
+    text = text.replace("{examples}", render_examples(examples))
     return (
         text.replace("{frames}", str(max(1, int(frames or 1))))
         .replace("{kind}", kind or "post")
@@ -165,6 +223,7 @@ class VisionVerdict:
     description: str = ""
     tags: List[str] = field(default_factory=list)
     frames: int = 0
+    on_screen_text: str = ""
     # Теги, яких немає у словнику. Не мовчазна втрата, а матеріал для того,
     # щоб словник ріс по реальному контенту.
     dropped: List[str] = field(default_factory=list)
@@ -247,7 +306,7 @@ class VisionClient:
     # ---------------------------------------------------------- класифікація
     def classify(self, images: Sequence[bytes], caption: str = "",
                  username: str = "", kind: str = "post",
-                 mode: str = "") -> VisionVerdict:
+                 mode: str = "", collections=None, examples=None) -> VisionVerdict:
         """Показує моделі кадри одного поста. Помилки повертає, а не кидає."""
         shots = [img for img in (images or []) if img][:MAX_FRAMES]
         if not shots:
@@ -259,12 +318,16 @@ class VisionClient:
 
         mode = mode or ("video" if len(shots) > 1 or kind in ("reel", "video")
                         else "image")
-        text = build_prompt(self.prompt, len(shots), kind, mode, self.taxonomy)
+        text = build_prompt(self.prompt, len(shots), kind, mode, self.taxonomy,
+                            examples=examples)
         context = []
         if username:
             context.append(f"Account: @{username}")
         if caption.strip():
             context.append(f"Caption: {caption.strip()[:400]}")
+        hint = collection_hint(collections)
+        if hint:
+            context.append(hint)
         if context:
             text += "\n\n" + "\n".join(context)
 
@@ -337,13 +400,17 @@ def parse_answer(text: str) -> VisionVerdict:
 
     description = _clean_text(data.get("description") or data.get("summary") or "")
     tags = clean_tags(data.get("tags"))
+    screen = data.get("on_screen_text") or data.get("screen_text") or ""
+    if isinstance(screen, (list, tuple)):
+        screen = " | ".join(str(part) for part in screen if str(part).strip())
+    screen = _clean_text(screen)[:500]
 
     category = str(data.get("category", "")).strip().lower()
     if category not in CATEGORIES:
         # Опис і теги вже є — віддаємо їх разом із помилкою, вони не винні.
         return VisionVerdict(
             error=f"невідома категорія «{category}»" if category else "модель не назвала категорію",
-            description=description, tags=tags,
+            description=description, tags=tags, on_screen_text=screen,
         )
     try:
         confidence = float(data.get("confidence", 0) or 0)
@@ -355,6 +422,7 @@ def parse_answer(text: str) -> VisionVerdict:
         why=str(data.get("why", ""))[:120],
         description=description,
         tags=tags,
+        on_screen_text=screen,
     )
 
 

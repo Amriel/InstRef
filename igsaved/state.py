@@ -94,6 +94,19 @@ CREATE TABLE IF NOT EXISTS tag_candidates (
     last_seen  TEXT,
     state      TEXT DEFAULT 'new'
 );
+CREATE TABLE IF NOT EXISTS fingerprints (
+    media_pk TEXT,
+    idx      INTEGER DEFAULT 0,
+    hash     TEXT,
+    PRIMARY KEY (media_pk, idx, hash)
+);
+CREATE TABLE IF NOT EXISTS exemplars (
+    media_pk    TEXT,
+    idx         INTEGER DEFAULT 0,
+    description TEXT,
+    added_at    TEXT,
+    PRIMARY KEY (media_pk, idx)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -125,6 +138,7 @@ def _ai_row(row) -> dict:
         "model": row["model"] or "",
         "frames": int(row["frames"] or 0),
         "prompt_hash": (row["prompt_hash"] or "") if "prompt_hash" in row.keys() else "",
+        "screen_text": (row["screen_text"] or "") if "screen_text" in row.keys() else "",
     }
 
 
@@ -153,6 +167,7 @@ class State:
         ("media", "attempts", "INTEGER DEFAULT 0"),
         ("media", "last_error", "TEXT"),
         ("ai_meta", "prompt_hash", "TEXT"),
+        ("ai_meta", "screen_text", "TEXT"),
         ("eagle_items", "item_id", "TEXT"),
     )
 
@@ -535,7 +550,8 @@ class State:
     # ------------------------------------------------- опис від моделі
     def set_ai_meta(self, media_pk: str, category: str, confidence: float,
                     description: str, tags: Iterable[str], model: str = "",
-                    frames: int = 0, idx: int = 0, prompt_hash: str = "") -> None:
+                    frames: int = 0, idx: int = 0, prompt_hash: str = "",
+                    screen_text: str = "") -> None:
         """Те, що модель написала про пост. Живе окремо від media, бо
         зʼявляється ще до того, як пост вирішено качати.
 
@@ -544,11 +560,12 @@ class State:
         with self._lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO ai_meta (media_pk, idx, category, confidence,"
-                " description, tags, model, frames, created_at, prompt_hash)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " description, tags, model, frames, created_at, prompt_hash, screen_text)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (str(media_pk), int(idx or 0), category or "", float(confidence or 0.0),
                  description or "", "\n".join(str(t) for t in (tags or []) if t),
-                 model or "", int(frames or 0), _now(), prompt_hash or ""),
+                 model or "", int(frames or 0), _now(), prompt_hash or "",
+                 screen_text or ""),
             )
             self.db.commit()
 
@@ -598,6 +615,117 @@ class State:
         with self._lock:
             row = self.db.execute("SELECT COUNT(*) AS c FROM ai_meta").fetchone()
         return int(row["c"]) if row else 0
+
+    def update_ai_tags(self, media_pk: str, idx: int, tags: Iterable[str]) -> None:
+        """Лише теги — для ретро-нормалізації без повторного запиту до моделі."""
+        with self._lock:
+            self.db.execute(
+                "UPDATE ai_meta SET tags = ? WHERE media_pk = ? AND idx = ?",
+                ("\n".join(str(t) for t in (tags or []) if t), str(media_pk), int(idx or 0)),
+            )
+            self.db.commit()
+
+    def update_ai_text(self, media_pk: str, idx: int, description: str,
+                       tags: Iterable[str]) -> None:
+        """Правка людини в картці перегляду: опис і теги, решта без змін."""
+        with self._lock:
+            self.db.execute(
+                "INSERT INTO ai_meta (media_pk, idx, description, tags, created_at)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(media_pk, idx) DO UPDATE SET"
+                " description = excluded.description, tags = excluded.tags",
+                (str(media_pk), int(idx or 0), description or "",
+                 "\n".join(str(t) for t in (tags or []) if t), _now()),
+            )
+            self.db.commit()
+
+    def ai_meta_rows(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.db.execute("SELECT * FROM ai_meta ORDER BY media_pk, idx").fetchall()
+
+    # ----------------------------------------------------- зразки описів
+    def add_exemplar(self, media_pk: str, idx: int, description: str) -> None:
+        with self._lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO exemplars (media_pk, idx, description, added_at)"
+                " VALUES (?,?,?,?)",
+                (str(media_pk), int(idx or 0), description or "", _now()),
+            )
+            self.db.commit()
+
+    def remove_exemplar(self, media_pk: str, idx: int = 0) -> None:
+        with self._lock:
+            self.db.execute(
+                "DELETE FROM exemplars WHERE media_pk = ? AND idx = ?", (str(media_pk), int(idx or 0))
+            )
+            self.db.commit()
+
+    def is_exemplar(self, media_pk: str, idx: int = 0) -> bool:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT 1 FROM exemplars WHERE media_pk = ? AND idx = ?",
+                (str(media_pk), int(idx or 0)),
+            ).fetchone()
+        return row is not None
+
+    def exemplars(self, limit: int = 3) -> list[str]:
+        """Найсвіжіші схвалені описи — для few-shot в інструкції."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT description FROM exemplars WHERE COALESCE(description, '') <> ''"
+                " ORDER BY added_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [str(r["description"]) for r in rows]
+
+    # ----------------------------------------------- перцептивні відбитки
+    def set_fingerprints(self, media_pk: str, idx: int, hashes: Iterable[int]) -> None:
+        with self._lock:
+            for value in hashes or []:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO fingerprints (media_pk, idx, hash) VALUES (?,?,?)",
+                    (str(media_pk), int(idx or 0), format(int(value), "016x")),
+                )
+            self.db.commit()
+
+    def has_fingerprints(self, media_pk: str) -> bool:
+        with self._lock:
+            row = self.db.execute(
+                "SELECT 1 FROM fingerprints WHERE media_pk = ? LIMIT 1", (str(media_pk),)
+            ).fetchone()
+        return row is not None
+
+    def all_fingerprints(self) -> list[tuple]:
+        """[(pk, hash)] — усе, з чим порівнювати новий пост."""
+        with self._lock:
+            rows = self.db.execute("SELECT media_pk, hash FROM fingerprints").fetchall()
+        result = []
+        for row in rows:
+            try:
+                result.append((str(row["media_pk"]), int(str(row["hash"]), 16)))
+            except ValueError:
+                continue
+        return result
+
+    def find_similar(self, hashes: Iterable[int], max_distance: int = 8,
+                     exclude_pk: str = "") -> Optional[tuple]:
+        """Найближчий уже відомий пост: (pk, відстань) або None."""
+        from .frames import hamming
+
+        best = None
+        known = self.all_fingerprints()
+        for value in hashes or []:
+            for pk, other in known:
+                if pk == str(exclude_pk):
+                    continue
+                distance = hamming(value, other)
+                if distance <= max_distance and (best is None or distance < best[1]):
+                    best = (pk, distance)
+        return best
+
+    def media_row(self, pk: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self.db.execute("SELECT * FROM media WHERE pk = ?", (str(pk),)).fetchone()
 
     # ------------------------------------------- кандидати у словник тегів
     def note_tag_candidates(self, tags: Iterable[str]) -> None:
@@ -752,7 +880,8 @@ class State:
     def forget_media(self, media_pk: str) -> None:
         """Прибирає пост із бази цілком — щоб не вважався завантаженим."""
         with self._lock:
-            for table in ("files", "membership", "eagle_items", "review", "ai_meta"):
+            for table in ("files", "membership", "eagle_items", "review", "ai_meta",
+                          "fingerprints", "exemplars"):
                 self.db.execute(f"DELETE FROM {table} WHERE media_pk = ?", (str(media_pk),))
             self.db.execute("DELETE FROM media WHERE pk = ?", (str(media_pk),))
             self.db.commit()

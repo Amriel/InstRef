@@ -22,6 +22,7 @@ COMMENT_LIMIT = 2000
 # Заголовок нашої частини нотатки. Англійський, бо й опис тепер англійський,
 # і за ним же впізнаємо вже описане при повторному проході.
 SUMMARY_LABEL = "Visual summary:"
+SCREEN_LABEL = "On screen:"
 
 
 @dataclass
@@ -87,12 +88,19 @@ class MediaTags:
         return "; ".join(unique[:30])
 
 
-def annotation(caption: str, description: str = "") -> str:
-    """Текст нотатки для Eagle: підпис автора плюс те, що побачила модель."""
+def annotation(caption: str, description: str = "", screen_text: str = "") -> str:
+    """Текст нотатки для Eagle: підпис автора плюс те, що побачила модель.
+
+    Текст з екрана — окремим рядком: у туторіалах саме там назви плагінів і
+    кроки, і саме за ними потім шукають.
+    """
     blocks = [text for text in ((caption or "").strip(),) if text]
     description = " ".join((description or "").split())
     if description:
         blocks.append(f"{SUMMARY_LABEL} {description}")
+    screen_text = " ".join((screen_text or "").split())
+    if screen_text:
+        blocks.append(f"{SCREEN_LABEL} {screen_text}")
     return "\n\n".join(blocks)
 
 

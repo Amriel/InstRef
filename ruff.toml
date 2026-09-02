@@ -3,7 +3,7 @@ target-version = "py310"
 
 [lint]
 select = ["E", "F", "W", "B"]
-ignore = ["E501", "B008", "B007"]
+ignore = ["E501", "B008", "B007", "B905"]
 
 [lint.per-file-ignores]
 "tests/*" = ["B", "E402"]

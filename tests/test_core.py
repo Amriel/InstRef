@@ -2544,6 +2544,10 @@ class _FakeEagle(BaseHTTPRequestHandler):
             self._send({"status": "success", "data": [
                 {"id": "root1", "name": "Instagram Saved", "children": [
                     {"id": "kid1", "name": "Пролайкане", "children": []}]}]})
+        elif "item/info" in self.path:
+            wanted = self.path.split("id=", 1)[-1].split("&")[0]
+            found = [i for i in self.items if str(i.get("id")) == wanted]
+            self._send({"status": "success", "data": found[0] if found else {}})
         elif "item/list" in self.path:
             offset = 0
             for part in self.path.split("?", 1)[-1].split("&"):
@@ -3460,3 +3464,244 @@ def test_session_file_round_trips(tmp_path):
     save_session({"sessionid": "abc%3Adef", "browser": "chrome"}, path)
     assert load_session(path) == {"sessionid": "abc%3Adef", "browser": "chrome"}
     assert load_session(tmp_path / "missing.json") == {}
+
+
+
+# ==========================================================================
+#  Спринт 2: конвеєр — кадри, текст з екрана, репости, словник, курсор лайків
+# ==========================================================================
+def _cut_video(path, scenes=((200, 30, 30), (30, 200, 30), (30, 30, 220)), each=40,
+               black_between=8):
+    """Ролик із кількох однотонних сцен, розділених чорними кадрами."""
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 25, (160, 120))
+    rng = np.random.default_rng(1)
+    for index, color in enumerate(scenes):
+        for _ in range(each):
+            frame = np.full((120, 160, 3), color, np.uint8)
+            frame[10:30, 10:30] = rng.integers(0, 255, 3)   # трохи руху всередині сцени
+            writer.write(frame)
+        if index < len(scenes) - 1:
+            for _ in range(black_between):
+                writer.write(np.zeros((120, 160, 3), np.uint8))
+    writer.release()
+    return path
+
+
+def test_frames_follow_scene_cuts_and_skip_black(tmp_path):
+    """Рівний крок у ролику з монтажем влучає в переходи; за сценами — ні."""
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from igsaved import frames
+
+    video = _cut_video(tmp_path / "cut.mp4")
+    shots = frames.extract(video, 3, by_scene=True)
+    assert len(shots) == 3
+    colours = []
+    for shot in shots:
+        image = cv2.imdecode(np.frombuffer(shot, np.uint8), cv2.IMREAD_COLOR)
+        mean = image.reshape(-1, 3).mean(axis=0)
+        assert mean.max() > 100            # жодного чорного кадру
+        colours.append(int(mean.argmax()))
+    assert colours == [0, 1, 2]            # по одному з кожної сцени, хронологічно
+
+
+def test_frame_budget_scales_with_duration():
+    from igsaved.frames import frame_budget
+
+    assert frame_budget(10, 6, 60) == 6            # короткий reel — не менше базового
+    assert frame_budget(180, 6, 60, 5.0) == 36     # три хвилини — по кадру на 5 с
+    assert frame_budget(3600, 6, 60) == 60         # стеля
+    assert frame_budget(0, 6, 60) == 6             # тривалість невідома
+
+
+def test_dhash_survives_reencoding_and_tells_different_apart(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from igsaved import frames
+
+    rng = np.random.default_rng(3)
+    base = rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)
+    base = cv2.GaussianBlur(base, (15, 15), 0)          # природна картинка, не шум
+    good = cv2.imencode(".jpg", base, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+    worse = cv2.imencode(".jpg", cv2.resize(base, (80, 60)),
+                         [cv2.IMWRITE_JPEG_QUALITY, 40])[1].tobytes()
+    other = cv2.imencode(".jpg", np.flipud(base))[1].tobytes()
+
+    a, b, c = frames.dhash(good), frames.dhash(worse), frames.dhash(other)
+    assert frames.hamming(a, b) <= 8                     # перекодування — той самий
+    assert frames.hamming(a, c) > 12                     # інша картинка — інший
+
+
+def test_repost_of_a_known_post_is_held_for_review(tmp_path, monkeypatch):
+    """Той самий ролик під іншим pk: інший хеш файлу, ті самі кадри."""
+    pytest.importorskip("cv2")
+    from igsaved.instagram import CollectionInfo
+
+    engine, cfg, state = _engine(tmp_path, eagle_enabled=False, dupe_action="review",
+                                 vision_describe_downloads=False, embed_metadata=False,
+                                 download_thumbnails=False)
+    try:
+        lines = []
+        engine.log = lines.append
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        original = _make_video(cfg.root / "orig.mp4")
+        state.record_media("1", "AAA", "first", None, 2, "clips", "", "https://ig/AAA/",
+                           status="done")
+        state.add_file(str(original), "1", "video", 0, 1)
+        state.set_fingerprints("1", 0, __import__("igsaved.frames", fromlist=["x"]).fingerprint(original))
+
+        media = _post(caption="repost", username="second", pk=2)
+        media.media_type = 2
+        media.video_url = "https://cdn/v.mp4"
+        media.thumbnail_url = ""
+        monkeypatch.setattr(engine, "_download_or_reuse",
+                            lambda url, dest, pk, kind: (dest.write_bytes(original.read_bytes())
+                                                         or dest.stat().st_size))
+        col = CollectionInfo("c", "Saved", 0)
+        engine._process_media(media, col)
+
+        assert state.is_pending_review("2")
+        row = state.pending_review()[0]
+        assert "схоже на вже наявний пост @first" in row["reason"]
+        assert row["verdict"] == "download"
+        assert any("можливий дубль" in line for line in lines)
+    finally:
+        state.close()
+
+
+def test_on_screen_text_is_parsed_and_lands_in_the_annotation():
+    from igsaved.tagging import annotation
+    from igsaved.vision import parse_answer
+
+    verdict = parse_answer(
+        '{"category": "art", "confidence": 0.9, "description": "A node graph.",'
+        ' "on_screen_text": ["Step 1: bake normals", "Houdini 20"], "tags": ["cgi"]}')
+    assert verdict.on_screen_text == "Step 1: bake normals | Houdini 20"
+    note = annotation("caption", verdict.description, verdict.on_screen_text)
+    assert "Visual summary: A node graph." in note
+    assert "On screen: Step 1: bake normals | Houdini 20" in note
+
+
+def test_prompt_gets_collection_hint_and_examples():
+    from igsaved.vision import build_prompt, collection_hint, prompt_hash
+
+    hint = collection_hint(["Houdini Tut"])
+    assert "Houdini Tut" in hint and "technique" in hint
+    assert "technique" not in collection_hint(["Cars"])
+    text = build_prompt("", 3, "reel", "video", None,
+                        examples=["Slow dolly along a chrome sculpture."])
+    assert "EXAMPLES" in text and "chrome sculpture" in text
+    assert "{examples}" not in build_prompt("", 3, "reel")
+    assert prompt_hash("", "a") != prompt_hash("", "b")
+    assert prompt_hash("", "a") == prompt_hash("   ", "a")
+
+
+def test_new_aliases_reach_users_with_an_old_taxonomy_file(tmp_path):
+    """Файл словника зберігся до появи нових синонімів — вони мають діяти й там."""
+    from igsaved.taxonomy import Taxonomy
+
+    old = Taxonomy()
+    old.aliases = {"skiing": "sport-action"}          # файл із одним синонімом
+    path = tmp_path / "taxonomy.json"
+    old.save(path)
+    loaded = Taxonomy.load(path)
+    kept, _ = loaded.normalize(["backlight", "mograph"], "video")
+    assert "backlit" in kept and "motion-graphics" in kept
+
+
+def test_normalize_library_fixes_old_tags_in_db_and_eagle(tmp_path):
+    """66 записів, зроблених до появи словника, лежать в Eagle із брудними
+    тегами — ретро-нормалізація виправляє їх без моделі."""
+    from igsaved.maintenance import normalize_library
+
+    _FakeEagle.updates = []
+    _FakeEagle.items = [
+        {"id": "e1", "name": "x", "tags": ["instagram", "render", "vibes", "manual-tag"],
+         "url": "https://www.instagram.com/p/AAA/"},
+    ]
+    server = HTTPServer(("127.0.0.1", 0), _FakeEagle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    state = State(tmp_path / "s.db")
+    try:
+        cfg = Config()
+        cfg.eagle_url = f"http://127.0.0.1:{server.server_port}"
+        state.record_media("1", "AAA", "u", None, 2, "clips", "", "https://www.instagram.com/p/AAA/",
+                           status="archived")
+        state.set_ai_meta("1", "art", 0.9, "d", ["render", "vibes", "backlight"], "m", 3)
+        state.mark_in_eagle("1", "c", "f", item_id="e1")
+
+        stats = normalize_library(cfg, state, log=lambda _m: None)
+        assert stats.changed == 1 and stats.eagle_updated == 1
+        tags = state.ai_meta("1")["tags"]
+        assert "render" not in tags and "vibes" not in tags
+        assert "3d-animation" in tags and "backlit" in tags
+        update = _FakeEagle.updates[0]
+        assert update["id"] == "e1"
+        assert "manual-tag" in update["tags"] and "instagram" in update["tags"]
+        assert "render" not in update["tags"] and "3d-animation" in update["tags"]
+    finally:
+        state.close()
+        server.shutdown()
+
+
+def test_liked_cursor_stops_at_the_previous_top(tmp_path, monkeypatch):
+    """Вікно «останні 50» губило те, що за його межею; курсор — ні."""
+    from igsaved.instagram import CollectionInfo
+
+    cfg = Config()
+    cfg.download_dir = str(tmp_path / "dl")
+    cfg.eagle_enabled = False
+    cfg.classify_liked = False
+    cfg.liked_scan_limit = 5
+    liked = CollectionInfo("liked", "Пролайкане", 0, is_liked=True)
+    state = State(tmp_path / "s.db")
+    try:
+        feed = [_post(caption="ref", username=f"a{i}", pk=100 - i) for i in range(80)]
+        engine, downloaded = _engine_over(monkeypatch, cfg, state, feed)
+        engine._sync_collection(liked)
+        assert engine.stats.scanned == 5                  # перший раз — вікно
+        assert state.get_meta("liked_top_pk") == "100"
+
+        # 70 нових лайків зверху — курсор дає пройти їх усі, а не 5
+        newer = [_post(caption="ref", username=f"n{i}", pk=1000 - i) for i in range(70)]
+        engine, downloaded = _engine_over(monkeypatch, cfg, state, newer + feed)
+        engine._sync_collection(liked)
+        assert engine.stats.scanned == 70
+        assert state.get_meta("liked_top_pk") == "1000"
+    finally:
+        state.close()
+
+
+def test_exemplars_feed_the_prompt(tmp_path):
+    state = State(tmp_path / "s.db")
+    try:
+        state.add_exemplar("1", 0, "Static wide shot of a chrome sculpture.")
+        state.add_exemplar("2", 0, "")
+        assert state.exemplars() == ["Static wide shot of a chrome sculpture."]
+        assert state.is_exemplar("1")
+        state.remove_exemplar("1")
+        assert state.exemplars() == []
+    finally:
+        state.close()
+
+
+def test_eagle_item_ids_are_learned_from_the_listing(tmp_path, monkeypatch):
+    engine, cfg, state = _engine(tmp_path, eagle_delete_local_after_import=True)
+    try:
+        state.record_media("1", "AAA", "u", None, 2, "clips", "", "https://www.instagram.com/p/AAA/",
+                           status="done")
+        state.mark_in_eagle("1", "c", "f")
+        assert state.without_eagle_item_id() == ["1"]
+        engine.eagle = types.SimpleNamespace(
+            iter_items=lambda folders: iter([{"id": "E1", "url": "https://www.instagram.com/p/AAA/"}]))
+        monkeypatch.setattr("igsaved.maintenance._our_folder_ids", lambda *a: ["f"])
+        present = engine._eagle_urls()
+        assert present == {"https://www.instagram.com/p/AAA"}
+        assert state.eagle_item_ids() == {"1": "E1"}
+    finally:
+        state.close()

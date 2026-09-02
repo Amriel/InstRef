@@ -39,6 +39,9 @@ from .tagging import MediaTags, annotation
 from .state import REVIEW_MODEL, REVIEW_RULES, State
 
 EAGLE_BATCH = 40
+# Стеля обходу лайків, коли є курсор: далі за нього і так не підемо, це лише
+# запобіжник від нескінченної стрічки, якщо курсор чомусь не трапився.
+LIKED_CURSOR_CEILING = 1000
 
 
 @dataclass
@@ -219,6 +222,7 @@ class SyncEngine:
                 self.state.touch_collection(col.pk)
 
             self._cleanup_imported()
+            self._describe_backlog()
             self._report_given_up()
             self.log(f"Готово: {self.stats.summary()}")
         except RateLimited as exc:
@@ -381,7 +385,8 @@ class SyncEngine:
         if mtype == 2 and want > 1 and framegrab.available():
             path = self._prefetch_video(media)
             if path is not None:
-                shots = framegrab.extract(path, want)
+                want = self._budget(path, want)
+                shots = framegrab.extract(path, want, by_scene=self.cfg.vision_frames_by_scene)
                 if shots:
                     if want > vision.SAFE_FRAMES:
                         # Про здрібнення кадрів варто сказати вголос: інакше
@@ -406,6 +411,17 @@ class SyncEngine:
             vision.thumbnail_url(media), self.cfg.request_timeout, self.cfg.proxy
         )
         return ([framegrab.shrink_image(cover)] if cover else []), kind
+
+    def _budget(self, path: Path, base: int) -> int:
+        """Скільки кадрів брати з цього конкретного ролика."""
+        per = float(self.cfg.vision_seconds_per_frame or 0)
+        if per <= 0:
+            return base
+        duration = framegrab.video_duration(path)
+        want = framegrab.frame_budget(duration, base, vision.MAX_FRAMES, per)
+        if want != base and duration:
+            self.log(f"   ⤓ {int(duration)} с → {want} кадр(ів)")
+        return want
 
     def _prefetch_video(self, media) -> Optional[Path]:
         url = str(getattr(media, "video_url", "") or "")
@@ -468,11 +484,14 @@ class SyncEngine:
             return False
 
         user = getattr(media, "user", None)
+        pk = str(getattr(media, "pk", "") or "")
         answer = self._vision.classify(
             shots,
             caption=getattr(media, "caption_text", "") or "",
             username=(getattr(user, "username", "") if user else "") or "",
             kind=kind, mode=taxonomy.mode_for(kind),
+            collections=self.state.collection_names_for(pk),
+            examples=self.state.exemplars(),
         )
         # Опис і теги зберігаємо навіть тоді, коли категорія не переконала:
         # вони однаково поїдуть у метадані файлу й у Eagle.
@@ -529,11 +548,14 @@ class SyncEngine:
         self.state.set_ai_meta(
             pk, answer.category if answer.ok else "", answer.confidence,
             answer.description, answer.tags, self._vision_model, answer.frames,
-            idx=idx,
+            idx=idx, prompt_hash=vision.prompt_hash(self.cfg.vision_prompt, self._vision_model),
+            screen_text=answer.on_screen_text,
         )
         prefix = f"[{label}] " if label else ""
         if answer.description:
             self.log(f"   ✎ {prefix}{answer.short_description()}")
+        if answer.on_screen_text:
+            self.log(f"   ⌨ {prefix}{answer.on_screen_text[:100]}")
         if answer.tags:
             self.log(f"   # {prefix}{', '.join(answer.tags[:10])}")
 
@@ -549,19 +571,26 @@ class SyncEngine:
         """
         if self._vision is None:
             return
-        want = max(1, min(vision.MAX_FRAMES, int(self.cfg.vision_frames or 1)))
+        base = max(1, min(vision.MAX_FRAMES, int(self.cfg.vision_frames or 1)))
         user = getattr(media, "user", None)
         caption = getattr(media, "caption_text", "") or ""
         username = (getattr(user, "username", "") if user else "") or ""
         kind = label_for(media)
         multi = len(files) > 1
+        collections = self.state.collection_names_for(pk)
+        examples = self.state.exemplars()
 
         for path, idx in files:
             if self.should_stop():
                 return
             if self.state.has_ai_meta(pk, idx):
                 continue
-            shots = framegrab.shots_from_file(path, want)
+            want = base
+            if path.suffix.lower() in framegrab.VIDEO_EXT:
+                want = self._budget(path, base)
+                shots = framegrab.extract(path, want, by_scene=self.cfg.vision_frames_by_scene)
+            else:
+                shots = framegrab.shots_from_file(path, want)
             if not shots:
                 self.log(f"   ⤼ нема з чого описати {path.name}")
                 continue
@@ -570,6 +599,7 @@ class SyncEngine:
                 kind="photo" if (multi and path.suffix.lower() not in
                                  framegrab.VIDEO_EXT) else kind,
                 mode=taxonomy.mode_for(path.name),
+                collections=collections, examples=examples,
             )
             if answer.error and not answer.has_text:
                 self.log(f"   ⤼ опис не склався: {answer.error}")
@@ -605,6 +635,13 @@ class SyncEngine:
         # Для пролайканого рахуємо саме переглянуті пости: відсіяні меми не
         # збільшують ліміт завантажень, тож без цього обхід не має кінця.
         scan_limit = self.cfg.liked_scan_limit if col.is_liked else self.cfg.scan_limit
+        # Курсор лайків: pk найсвіжішого поста з попереднього проходу. Стрічка
+        # лайків іде від нових до старих, тож дійшовши до нього, ми бачили все
+        # нове — і вікно «останні 50» більше нічого не губить.
+        cursor = self.state.get_meta("liked_top_pk") if col.is_liked else ""
+        if cursor:
+            scan_limit = max(int(scan_limit or 0), LIKED_CURSOR_CEILING)
+        new_top = ""
         total_hint = min(col.media_count, scan_limit) if (col.media_count and scan_limit) \
             else (scan_limit or col.media_count or 0)
 
@@ -618,11 +655,17 @@ class SyncEngine:
                 if scan_limit and seen >= scan_limit:
                     self.log(f"   переглянуто {seen} найсвіжіших — ліміт вичерпано")
                     return
+                pk = str(getattr(media, "pk", "") or "")
+                if col.is_liked and pk:
+                    if not new_top:
+                        new_top = pk
+                    if cursor and pk == cursor:
+                        self.log(f"   дійшов до вже переглянутого ({seen} нових з минулого разу)")
+                        return
                 seen += 1
                 self.stats.scanned += 1
                 self.progress(f"{col.display}: {seen}", seen, total_hint)
 
-                pk = str(getattr(media, "pk", "") or "")
                 if not pk:
                     continue
                 self.state.add_membership(pk, col.pk, col.display)
@@ -678,6 +721,9 @@ class SyncEngine:
             self.stats.failed += 1
             self.stats.errors.append(str(exc))
             self.log(f"   ✖ {exc}")
+        finally:
+            if col.is_liked and new_top and not self.should_stop():
+                self.state.set_meta("liked_top_pk", new_top)
 
     def _note_failure(self, media, pk: str, exc: Exception) -> None:
         """Невдача по одному посту: рахуємо, після N — здаємось."""
@@ -720,8 +766,10 @@ class SyncEngine:
             media,
             want_videos=self.cfg.download_videos,
             want_photos=self.cfg.download_photos,
-            # для ревʼю прев'ю тягнемо завжди — інакше у вікні нічого показати
-            want_thumbs=self.cfg.download_thumbnails or held,
+            # Превʼю для перегляду робиться з кадру самого файлу (див. нижче) —
+            # окремий запит до CDN потрібен, лише якщо кадри дістати нічим.
+            want_thumbs=self.cfg.download_thumbnails
+            or (held and not framegrab.available()),
         )
         if not assets:
             self.stats.skipped += 1
@@ -784,8 +832,42 @@ class SyncEngine:
         if not media_paths:
             raise RuntimeError("жоден файл не завантажився")
 
+        # Репост? Відбиток кадрів ловить той самий ролик під іншим pk.
+        twin = self._fingerprint(pk, indexed)
+        if twin is not None and not held:
+            action = (self.cfg.dupe_action or "review").lower()
+            twin_pk, distance = twin
+            row = self.state.media_row(twin_pk)
+            who = f"@{row['username']}" if row and row["username"] else twin_pk
+            note = f"схоже на вже наявний пост {who} (відстань {distance})"
+            if row and row["url"]:
+                note += f" {row['url']}"
+            if action == "skip":
+                self.log(f"   ⨯ {base}: {note} — не беру")
+                for path in media_paths:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                self.state.mark_skipped(pk, note)
+                self.stats.filtered += 1
+                return
+            if action == "review":
+                held = True
+                dupe_note = note
+                if verdict is None:
+                    verdict = classifier.Verdict(DOWNLOAD, [note])
+                else:
+                    verdict.reasons.append(note)
+            else:
+                self.log(f"   ≈ {base}: {note} — імпортую як є")
+                dupe_note = ""
+        else:
+            dupe_note = ""
+
         # Опис пишемо до вшивання тегів — інакше він не потрапить у файл.
-        if self.cfg.vision_describe_downloads:
+        if self.cfg.vision_describe_downloads and \
+                str(col.pk) not in set(self.cfg.describe_skip_collections or []):
             self._describe(media, pk, indexed)
         if self.cfg.embed_metadata:
             for path, idx in indexed:
@@ -798,6 +880,9 @@ class SyncEngine:
         self.stats.downloaded += 1
         kind = label_for(media)
 
+        if held and thumb_path is None:
+            thumb_path = self._preview_from_file(media_paths[0], base)
+
         if held:
             self.stats.to_review += 1
             preview = thumb_path or (media_paths[0] if media_paths else None)
@@ -808,6 +893,8 @@ class SyncEngine:
             )
             mark = "≈" if glance else "?"
             where = "рішення моделі" if glance else "ревʼю"
+            if dupe_note:
+                where = "ревʼю (можливий дубль)"
             self.log(f"   {mark} {base} [{kind}] → {where}: {verdict.why()}")
             # У Eagle свідомо не відправляємо: бібліотека має отримувати лише
             # те, що ти бачив. Імпорт станеться після кнопки у вкладці.
@@ -815,6 +902,39 @@ class SyncEngine:
             why = f" — {verdict.why()}" if verdict is not None else ""
             self.log(f"   ✓ {base} [{kind}]{why}")
             self._queue_eagle(media, col, media_paths)
+
+    def _fingerprint(self, pk: str, indexed: List[tuple]) -> Optional[tuple]:
+        """Записує відбитки файлів поста; повертає (pk, відстань) найближчого
+        вже відомого поста або None."""
+        if not framegrab.available():
+            return None
+        hashes: List[int] = []
+        for path, idx in indexed:
+            values = framegrab.fingerprint(path)
+            if values:
+                self.state.set_fingerprints(pk, idx, values)
+                hashes.extend(values)
+        if not hashes or (self.cfg.dupe_action or "review").lower() == "off":
+            return None
+        return self.state.find_similar(
+            hashes, int(self.cfg.dupe_max_distance or 8), exclude_pk=pk)
+
+    def _preview_from_file(self, path: Path, base: str) -> Optional[Path]:
+        """Превʼю для картки перегляду з самого файлу — без запиту до CDN."""
+        try:
+            if path.suffix.lower() in framegrab.VIDEO_EXT:
+                shots = framegrab.extract(path, 1, max_side=640, by_scene=False)
+                data = shots[0] if shots else b""
+            else:
+                return path
+            if not data:
+                return None
+            self.cfg.thumbs_dir.mkdir(parents=True, exist_ok=True)
+            dest = self.cfg.thumbs_dir / f"{base}.jpg"
+            dest.write_bytes(data)
+            return dest
+        except OSError:
+            return None
 
     def _free_path(self, dest: Path, pk: str) -> Path:
         """Читабельні назви можуть збігтися у двох різних постів — тоді беремо
@@ -895,10 +1015,19 @@ class SyncEngine:
         try:
             folders = _our_folder_ids(self.eagle, self.cfg, self.log)
             present = set()
+            by_url = self.state.media_by_url()
+            missing = set(self.state.without_eagle_item_id())
             for item in self.eagle.iter_items(folders):
                 url = str(item.get("url") or "").rstrip("/")
                 if url:
                     present.add(url)
+                    # Заодно запамʼятовуємо id елемента: імпорт асинхронний,
+                    # тож дізнатись його можна лише отак, з наступного списку.
+                    pk = by_url.get(url)
+                    item_id = str(item.get("id") or "")
+                    if pk and item_id and pk in missing:
+                        self.state.set_eagle_item_id(pk, item_id)
+                        missing.discard(pk)
             return present
         except EagleError as exc:
             self.log(f"Прибирання відкладено: Eagle не віддав список ({exc}).")
@@ -955,6 +1084,30 @@ class SyncEngine:
                 f"   {waiting} пост(ів) ще не видно в бібліотеці — "
                 "лишаю до наступного проходу."
             )
+
+    def _describe_backlog(self) -> None:
+        """Після проходу — ще кілька описів для старої бібліотеки.
+
+        Бекфіл руками — багатогодинний і тому не робиться. Десяток елементів
+        за прохід непомітний, а за місяць планових проходів покриває бібліотеку.
+        """
+        budget = int(self.cfg.describe_backlog_per_run or 0)
+        if budget <= 0 or self._vision is None or not self.eagle:
+            return
+        if self.should_stop():
+            return
+        from .maintenance import describe_library
+
+        self.log(f"── Дописую описи бібліотеці Eagle (до {budget} за прохід)")
+        try:
+            result = describe_library(
+                self.cfg, self.state, self.log, self.should_stop, limit=budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — бонус не має валити прохід
+            self.log(f"   ⤼ дозапис описів не вдався: {exc}")
+            return
+        if result.described:
+            self.log(f"   описано ще {result.described}")
 
     # =============================================================== Eagle
     def _setup_eagle(self) -> None:
@@ -1025,7 +1178,7 @@ class SyncEngine:
             path=str(path),
             name=short_title(caption, username, code),
             website=media_url(code),
-            annotation=annotation(caption, ai.get("description", "")),
+            annotation=annotation(caption, ai.get("description", ""), ai.get("screen_text", "")),
             tags=unique,
         )
 
