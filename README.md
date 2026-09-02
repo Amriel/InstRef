@@ -43,6 +43,13 @@ tags drawn from a fixed vocabulary of ~370 terms across 29 categories.
 noisier, so rules plus the model sort memes from references. Anything either is
 unsure about waits in a review tab with a big preview and two buttons.
 
+**Catches reposts.** The same reel posted by three accounts is three posts and
+three different files. A perceptual hash of the frames recognises it anyway
+and holds the copy for review with a note about the original.
+
+**Takes single links too.** Paste a few post URLs and they go through the same
+pipeline — download, describe, Eagle — onto a "By link" shelf.
+
 ---
 
 ## Install
@@ -92,14 +99,20 @@ Python 3.10+. On Windows `install.bat` does the same thing in one click.
 
 ## The vision model
 
-The model receives frames sampled evenly across a clip — 6 by default, up to 60
-— rather than the cover image. Judging a reel by its first frame was the single
-largest source of misclassification. Carousels are described slide by slide,
-because slides are different pictures and one shared description would be a
-lie about each of them.
+The model receives frames from across the clip rather than the cover image —
+judging a reel by its first frame was the single largest source of
+misclassification. Frames are picked **by scene cut**, not at even intervals:
+a fast-cut reel sampled evenly lands on transitions and black frames. How many
+depends on length — roughly one per five seconds, between 6 and 60. Carousels
+are described slide by slide, because slides are different pictures and one
+shared description would be a lie about each of them.
 
-It returns three things: a filing category, an English description written like
-a director's note, and tags.
+It returns four things: a filing category, an English description written like
+a director's note, any **text visible on screen** (step titles, plugin names —
+what tutorials are actually searched by), and tags. Posts saved in a collection
+named like a tutorial get a hint to describe the technique, not the picture.
+Optionally, with `faster-whisper` installed, the voice-over is transcribed and
+handed to the model as context.
 
 **Tags come from a controlled vocabulary.** `3d-render`, `3drender`, `render`
 and `3d` are four different tags to Eagle and none of them finds the others —
@@ -123,6 +136,15 @@ Recommended model: `Qwen3-VL-4B-Instruct`. Take **Instruct**, not **Thinking** �
 reasoning variants spend hundreds of tokens deliberating before producing the
 one line of JSON we need.
 
+Descriptions you like can be starred in the review tab; the last few become
+examples in the prompt, so the model's register drifts towards yours rather
+than mine. Old descriptions written before the vocabulary existed can be
+re-normalised in one click without asking the model again, and a vocabulary
+report shows which tags are overused and which never fire.
+
+The library gets described in the background: after every sync, a handful of
+older Eagle items without a description get one, so coverage grows on its own.
+
 ---
 
 ## Review
@@ -135,6 +157,12 @@ entirely yours. Rejected posts appear too — the clip was already downloaded to
 extract frames, so showing it costs nothing, and a wrong "meme" would otherwise
 be invisible. Those sort first, because a wrong rejection costs you a post while
 a wrong approval costs you a file.
+
+Each card shows a filmstrip of the clip and the model's description and tags
+in editable fields — fix them there and the corrected version is what lands in
+Eagle. Keyboard works: arrows to move, `Y` keep, `N` drop, `O` open. The tab
+also keeps score of how often you agree with the model, per category, which is
+a far more honest measure of its accuracy than its self-reported confidence.
 
 Nothing reaches Eagle before you have seen it.
 
@@ -175,6 +203,14 @@ see it as automation, because that is what it is.
 Instagram flags **pace**, not volume: short even intervals and repeated logins
 look like a script. InstRef defends the account by asking less often, not by
 hiding — it refuses to run twice within `min_hours_between_runs` (6 by default),
-reuses a stored session instead of logging in fresh each time, and waits 8–15
-seconds between pages. Lower those at your own risk, and expect a warning from
-Instagram if you sync many times an hour.
+reuses a stored session instead of logging in fresh each time, waits 8–15
+seconds between pages, starts scheduled runs at a random offset, never runs two
+syncs at once, and if Instagram answers "please wait a few minutes" it stops
+the whole run and stays away for a day — even if you press the button. Posts
+that keep failing (deleted, private) are given up on after three attempts
+instead of being retried forever. Lower those at your own risk, and expect a
+warning from Instagram if you sync many times an hour.
+
+The session cookie is stored encrypted with Windows DPAPI, the database is
+backed up weekly and before every migration, and the app checks GitHub once a
+day for a newer release.
