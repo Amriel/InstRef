@@ -23,6 +23,7 @@ COMMENT_LIMIT = 2000
 # і за ним же впізнаємо вже описане при повторному проході.
 SUMMARY_LABEL = "Visual summary:"
 SCREEN_LABEL = "On screen:"
+TRANSCRIPT_LABEL = "Voice-over:"
 
 
 @dataclass
@@ -88,7 +89,8 @@ class MediaTags:
         return "; ".join(unique[:30])
 
 
-def annotation(caption: str, description: str = "", screen_text: str = "") -> str:
+def annotation(caption: str, description: str = "", screen_text: str = "",
+               transcript: str = "") -> str:
     """Текст нотатки для Eagle: підпис автора плюс те, що побачила модель.
 
     Текст з екрана — окремим рядком: у туторіалах саме там назви плагінів і
@@ -101,6 +103,9 @@ def annotation(caption: str, description: str = "", screen_text: str = "") -> st
     screen_text = " ".join((screen_text or "").split())
     if screen_text:
         blocks.append(f"{SCREEN_LABEL} {screen_text}")
+    transcript = " ".join((transcript or "").split())
+    if transcript:
+        blocks.append(f"{TRANSCRIPT_LABEL} {transcript[:800]}")
     return "\n\n".join(blocks)
 
 

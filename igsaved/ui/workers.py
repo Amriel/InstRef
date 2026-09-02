@@ -285,6 +285,21 @@ class HealthWorker(QThread):
         self.done.emit(result)
 
 
+class UpdateWorker(QThread):
+    """Раз на добу питає GitHub, чи є новіший реліз."""
+
+    done = Signal(object)  # dict | None
+
+    def __init__(self, current: str, parent=None):
+        super().__init__(parent)
+        self.current = current
+
+    def run(self) -> None:
+        from .. import updates
+
+        self.done.emit(updates.check(self.current))
+
+
 class SyncWorker(QThread):
     """Повний прохід синхронізації."""
 

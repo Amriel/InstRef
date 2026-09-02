@@ -1121,7 +1121,8 @@ def _eagle_item(cfg: Config, post: _Post, collection: str, path: Path, idx: int 
         name=short_title(post.caption, post.username, post.code),
         website=f"https://www.instagram.com/p/{post.code}/" if post.code else "",
         annotation=tagging.annotation(
-            post.caption, slide.get("description", post.description)),
+            post.caption, slide.get("description", post.description),
+            slide.get("screen_text", ""), slide.get("transcript", "")),
         tags=unique,
     )
 

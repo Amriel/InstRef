@@ -200,6 +200,7 @@ class Config:
     minimize_to_tray: bool = True
     start_minimized: bool = False
     notify_on_finish: bool = True
+    check_updates: bool = True
 
     # --- фільтр пролайканого ---
     # Працює ТІЛЬКИ для пролайканого: збережене користувач курує сам.
@@ -239,6 +240,11 @@ class Config:
     # Після планового проходу описати ще стільки елементів бібліотеки Eagle,
     # яким опису бракує — покриття росте само. 0 = вимкнено.
     describe_backlog_per_run: int = 10
+    # Транскрипція голосу за кадром (faster-whisper, встановлюється окремо).
+    # Порожній список підбірок = усі, коли ввімкнено.
+    transcribe_enabled: bool = False
+    transcribe_collections: List[str] = field(default_factory=list)
+    transcribe_model: str = "small"
     # pk підбірок, для яких описи не потрібні (модель не витрачає хвилину на
     # ролик, який і так зрозумілий за назвою підбірки).
     describe_skip_collections: List[str] = field(default_factory=list)

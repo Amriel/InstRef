@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional
 from . import classify as classifier
 from . import frames as framegrab
 from . import taxonomy
+from . import transcribe
 from . import vision
 from .classify import DOWNLOAD, REVIEW, SKIP, Rules
 from .config import (
@@ -650,7 +651,7 @@ class SyncEngine:
             pk, answer.category if answer.ok else "", answer.confidence,
             answer.description, answer.tags, self._vision_model, answer.frames,
             idx=idx, prompt_hash=vision.prompt_hash(self.cfg.vision_prompt, self._vision_model),
-            screen_text=answer.on_screen_text,
+            screen_text=answer.on_screen_text, transcript=getattr(answer, "transcript", ""),
         )
         prefix = f"[{label}] " if label else ""
         if answer.description:
@@ -695,13 +696,15 @@ class SyncEngine:
             if not shots:
                 self.log(f"   ⤼ нема з чого описати {path.name}")
                 continue
+            speech = self._transcript(path, pk)
             answer = self._vision.classify(
                 shots, caption=caption, username=username,
                 kind="photo" if (multi and path.suffix.lower() not in
                                  framegrab.VIDEO_EXT) else kind,
                 mode=taxonomy.mode_for(path.name),
-                collections=collections, examples=examples,
+                collections=collections, examples=examples, transcript=speech,
             )
+            answer.transcript = speech
             if answer.error and not answer.has_text:
                 self.log(f"   ⤼ опис не склався: {answer.error}")
                 continue
@@ -712,6 +715,23 @@ class SyncEngine:
                 continue
             self._save_ai(media, answer, idx=idx,
                           label=path.name if multi else "")
+
+    def _transcript(self, path: Path, pk: str) -> str:
+        """Голос за кадром, якщо ввімкнено для цієї підбірки і є чим."""
+        if not self.cfg.transcribe_enabled or path.suffix.lower() not in framegrab.VIDEO_EXT:
+            return ""
+        wanted = {str(c) for c in (self.cfg.transcribe_collections or [])}
+        if wanted and not (wanted & set(self.state.collection_pks_for(pk))):
+            return ""
+        if not transcribe.available():
+            if not getattr(self, "_warned_no_whisper", False):
+                self._warned_no_whisper = True
+                self.log(f"   ⤼ транскрипція ввімкнена, але faster-whisper не встановлено ({transcribe.INSTALL_HINT})")
+            return ""
+        text = transcribe.transcribe(path, self.cfg.transcribe_model or "small")
+        if text:
+            self.log(f"   🗣 {text[:90]}{'…' if len(text) > 90 else ''}")
+        return text
 
     def _record_skip(self, media, verdict) -> None:
         pk = str(getattr(media, "pk", ""))
@@ -1279,7 +1299,8 @@ class SyncEngine:
             path=str(path),
             name=short_title(caption, username, code),
             website=media_url(code),
-            annotation=annotation(caption, ai.get("description", ""), ai.get("screen_text", "")),
+            annotation=annotation(caption, ai.get("description", ""), ai.get("screen_text", ""),
+                                  ai.get("transcript", "")),
             tags=unique,
         )
 

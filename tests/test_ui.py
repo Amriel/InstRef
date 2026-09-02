@@ -38,6 +38,7 @@ def window(app, tmp_path, monkeypatch):
     monkeypatch.setattr(cfgmod, "STATE_PATH", tmp_path / "state.db")
     monkeypatch.setattr(mw, "STATE_PATH", tmp_path / "state.db")
     monkeypatch.setattr(mw.MainWindow, "_check_health", lambda self: None)
+    monkeypatch.setattr(mw.MainWindow, "_check_updates", lambda self: None)
     monkeypatch.setattr(QMessageBox, "question",
                         staticmethod(lambda *a, **k: QMessageBox.Yes))
     monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
@@ -186,3 +187,10 @@ def test_quick_start_indicators_reflect_health(window):
     window._on_health({"eagle": (False, "nope"), "model": (True, "qwen")})
     assert "Модель: qwen" in window.ind_model.text.text()
     assert window.ind_model.button.isHidden() or not window.ind_model.button.isVisible()
+
+
+def test_update_notice_appears_for_a_newer_release(window):
+    window._on_update_checked({"version": "99.0.0", "url": "https://x/r"})
+    assert window.update_notice.isVisibleTo(window)
+    assert "99.0.0" in window.update_text.text()
+    assert window.state.get_meta("last_update_check")

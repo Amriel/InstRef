@@ -224,6 +224,7 @@ class VisionVerdict:
     tags: List[str] = field(default_factory=list)
     frames: int = 0
     on_screen_text: str = ""
+    transcript: str = ""       # голос за кадром, якщо транскрибували
     # Теги, яких немає у словнику. Не мовчазна втрата, а матеріал для того,
     # щоб словник ріс по реальному контенту.
     dropped: List[str] = field(default_factory=list)
@@ -306,7 +307,8 @@ class VisionClient:
     # ---------------------------------------------------------- класифікація
     def classify(self, images: Sequence[bytes], caption: str = "",
                  username: str = "", kind: str = "post",
-                 mode: str = "", collections=None, examples=None) -> VisionVerdict:
+                 mode: str = "", collections=None, examples=None,
+                 transcript: str = "") -> VisionVerdict:
         """Показує моделі кадри одного поста. Помилки повертає, а не кидає."""
         shots = [img for img in (images or []) if img][:MAX_FRAMES]
         if not shots:
@@ -328,6 +330,10 @@ class VisionClient:
         hint = collection_hint(collections)
         if hint:
             context.append(hint)
+        if transcript and transcript.strip():
+            context.append(
+                "Voice-over transcript (what the author SAYS; use it to name the "
+                f"technique, do not retell it): {transcript.strip()[:1200]}")
         if context:
             text += "\n\n" + "\n".join(context)
 

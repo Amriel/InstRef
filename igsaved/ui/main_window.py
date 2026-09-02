@@ -41,7 +41,7 @@ from .review_tab import ReviewTab
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
     DupeWorker, HealthWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
-    UrlWorker,
+    UpdateWorker, UrlWorker,
 )
 
 EAGLE_DEFAULT_URL = "http://localhost:41595"
@@ -205,6 +205,7 @@ class MainWindow(QMainWindow):
         self.dupe_worker: Optional[DupeWorker] = None
         self.url_worker: Optional[UrlWorker] = None
         self.health_worker: Optional[HealthWorker] = None
+        self.update_worker: Optional[UpdateWorker] = None
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1020, 720)
@@ -220,6 +221,7 @@ class MainWindow(QMainWindow):
         self._refresh_status()
         QTimer.singleShot(300, self._startup_hints)
         QTimer.singleShot(500, self._check_health)
+        QTimer.singleShot(2500, self._check_updates)
 
     # ------------------------------------------------------------------ трей
     def _build_tray(self) -> None:
@@ -325,6 +327,22 @@ class MainWindow(QMainWindow):
         self.btn_open_folder.clicked.connect(self.on_open_folder)
         bar.addWidget(self.btn_open_folder)
         layout.addLayout(bar)
+
+        self.update_notice = QFrame()
+        self.update_notice.setProperty("role", "notice")
+        notice = QHBoxLayout(self.update_notice)
+        notice.setContentsMargins(12, 8, 10, 8)
+        self.update_text = _label("", "title")
+        notice.addWidget(self.update_text, 1)
+        self.btn_update = QPushButton("Завантажити")
+        self.btn_update.clicked.connect(self._open_update)
+        self.btn_update_close = QPushButton("Пізніше")
+        self.btn_update_close.clicked.connect(lambda: self.update_notice.setVisible(False))
+        notice.addWidget(self.btn_update)
+        notice.addWidget(self.btn_update_close)
+        self.update_notice.setVisible(False)
+        self._update_url = ""
+        layout.addWidget(self.update_notice)
 
         # Швидкий старт: три індикатори того, без чого конвеєр не працює.
         self.quick = QFrame()
@@ -450,6 +468,40 @@ class MainWindow(QMainWindow):
         box.text.setText(f"{title}: {detail}")
         box.text.setToolTip(detail)
         box.button.setVisible(not ok)
+
+    def _check_updates(self) -> None:
+        if not self.cfg.check_updates:
+            return
+        last = self.state.get_meta("last_update_check")
+        if last:
+            try:
+                from datetime import timedelta, timezone
+                when = datetime.fromisoformat(last)
+                if datetime.now(timezone.utc) - when < timedelta(hours=20):
+                    return
+            except ValueError:
+                pass
+        self.update_worker = UpdateWorker(__version__, self)
+        self.update_worker.done.connect(self._on_update_checked)
+        self.update_worker.start()
+
+    def _on_update_checked(self, latest) -> None:
+        from datetime import timezone
+        self.state.set_meta("last_update_check",
+                            datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        if not latest:
+            return
+        self._update_url = latest.get("url") or ""
+        self.update_text.setText(
+            f"Є нова версія {latest.get('version')} (у тебе {__version__}).")
+        self.update_notice.setVisible(True)
+        self._log(f"Доступне оновлення InstRef {latest.get('version')}: {self._update_url}")
+
+    def _open_update(self) -> None:
+        import webbrowser
+
+        if self._update_url:
+            webbrowser.open(self._update_url)
 
     def _open_settings(self, page: int) -> None:
         self.tabs.setCurrentIndex(1)
@@ -889,6 +941,24 @@ class MainWindow(QMainWindow):
             "Eagle, яким опису бракує. Десяток за прохід непомітний, а за місяць "
             "планових проходів покриває стару бібліотеку."))
 
+        self.ck_transcribe = QCheckBox("Транскрибувати голос за кадром (faster-whisper)")
+        self.ck_transcribe.setToolTip(
+            "Туторіали пояснюють техніку словами — кадри цього не передають.\n"
+            "Потрібен пакет faster-whisper: pip install faster-whisper."
+        )
+        self.ed_whisper = QLineEdit()
+        self.ed_whisper.setPlaceholderText("small")
+        self.ed_whisper.setFixedWidth(120)
+        self.ed_whisper.setToolTip("Розмір моделі Whisper: tiny / base / small / medium")
+        transcribe_row = QHBoxLayout()
+        transcribe_row.addWidget(self.ck_transcribe)
+        transcribe_row.addWidget(self.ed_whisper)
+        transcribe_row.addStretch(1)
+        form.addRow(_flabel(""), _row(transcribe_row))
+        form.addRow(_flabel(""), _hint(
+            "Текст мовлення йде в інструкцію моделі як контекст і в нотатку Eagle. "
+            "Повільно (ЦП), тому вмикай для підбірок із туторіалами, а не для всього."))
+
         self.ck_vision_describe = QCheckBox("Писати опис і теги для кожного нового поста")
         self.ck_vision_describe.setToolTip(
             "Не лише для сумнівних: модель подивиться кожне нове завантаження."
@@ -1161,10 +1231,11 @@ class MainWindow(QMainWindow):
         self.ck_sync_launch = QCheckBox("Синхронізувати одразу після запуску")
         self.ck_tray = QCheckBox("Закриття вікна згортає в трей")
         self.ck_notify = QCheckBox("Сповіщення після завершення")
+        self.ck_updates = QCheckBox("Перевіряти нові версії на GitHub раз на добу")
         behaviour = QVBoxLayout()
         behaviour.setSpacing(4)
         for widget in (self.ck_run_at_login, self.ck_start_min, self.ck_sync_launch,
-                       self.ck_tray, self.ck_notify):
+                       self.ck_tray, self.ck_notify, self.ck_updates):
             behaviour.addWidget(widget)
         form.addRow(_flabel("Поведінка"), _row(behaviour))
         return page
@@ -1413,6 +1484,9 @@ class MainWindow(QMainWindow):
         self.ck_sync_launch.setChecked(cfg.sync_on_launch)
         self.ck_tray.setChecked(cfg.minimize_to_tray)
         self.ck_notify.setChecked(cfg.notify_on_finish)
+        self.ck_updates.setChecked(cfg.check_updates)
+        self.ck_transcribe.setChecked(cfg.transcribe_enabled)
+        self.ed_whisper.setText(cfg.transcribe_model)
 
         browser_index = self.cb_browser.findData(cfg.browser)
         self.cb_browser.setCurrentIndex(max(0, browser_index))
@@ -1505,6 +1579,9 @@ class MainWindow(QMainWindow):
         cfg.sync_on_launch = self.ck_sync_launch.isChecked()
         cfg.minimize_to_tray = self.ck_tray.isChecked()
         cfg.notify_on_finish = self.ck_notify.isChecked()
+        cfg.check_updates = self.ck_updates.isChecked()
+        cfg.transcribe_enabled = self.ck_transcribe.isChecked()
+        cfg.transcribe_model = self.ed_whisper.text().strip() or "small"
         cfg.browser = self.cb_browser.currentData() or "auto"
 
         selected = self._checked_pks()

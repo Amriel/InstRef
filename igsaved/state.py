@@ -146,6 +146,7 @@ def _ai_row(row) -> dict:
         "frames": int(row["frames"] or 0),
         "prompt_hash": (row["prompt_hash"] or "") if "prompt_hash" in row.keys() else "",
         "screen_text": (row["screen_text"] or "") if "screen_text" in row.keys() else "",
+        "transcript": (row["transcript"] or "") if "transcript" in row.keys() else "",
     }
 
 
@@ -175,6 +176,7 @@ class State:
         ("media", "last_error", "TEXT"),
         ("ai_meta", "prompt_hash", "TEXT"),
         ("ai_meta", "screen_text", "TEXT"),
+        ("ai_meta", "transcript", "TEXT"),
         ("eagle_items", "item_id", "TEXT"),
     )
 
@@ -558,7 +560,7 @@ class State:
     def set_ai_meta(self, media_pk: str, category: str, confidence: float,
                     description: str, tags: Iterable[str], model: str = "",
                     frames: int = 0, idx: int = 0, prompt_hash: str = "",
-                    screen_text: str = "") -> None:
+                    screen_text: str = "", transcript: str = "") -> None:
         """Те, що модель написала про пост. Живе окремо від media, бо
         зʼявляється ще до того, як пост вирішено качати.
 
@@ -567,12 +569,12 @@ class State:
         with self._lock:
             self.db.execute(
                 "INSERT OR REPLACE INTO ai_meta (media_pk, idx, category, confidence,"
-                " description, tags, model, frames, created_at, prompt_hash, screen_text)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " description, tags, model, frames, created_at, prompt_hash, screen_text,"
+                " transcript) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(media_pk), int(idx or 0), category or "", float(confidence or 0.0),
                  description or "", "\n".join(str(t) for t in (tags or []) if t),
                  model or "", int(frames or 0), _now(), prompt_hash or "",
-                 screen_text or ""),
+                 screen_text or "", transcript or ""),
             )
             self.db.commit()
 

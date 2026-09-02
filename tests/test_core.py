@@ -3738,3 +3738,21 @@ def test_run_urls_feeds_the_same_pipeline(tmp_path, monkeypatch):
         assert state.last_runs(1)[0]["note"] == "за посиланням"
     finally:
         state.close()
+
+
+def test_version_comparison_for_update_check():
+    from igsaved.updates import is_newer, parse_version
+
+    assert parse_version("v2.3.0") == (2, 3, 0)
+    assert is_newer("v2.3.1", "2.3.0") and not is_newer("2.3.0", "2.3.0")
+    assert not is_newer("2.2.9", "2.3.0")
+
+
+def test_transcription_is_optional_and_silent_without_whisper(tmp_path, monkeypatch):
+    from igsaved import transcribe
+    from igsaved.tagging import annotation
+
+    monkeypatch.setattr(transcribe, "available", lambda: False)
+    assert transcribe.transcribe(tmp_path / "x.mp4") == ""
+    note = annotation("c", "d", "", "we bake the normals first")
+    assert "Voice-over: we bake the normals first" in note
