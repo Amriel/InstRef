@@ -107,6 +107,13 @@ CREATE TABLE IF NOT EXISTS exemplars (
     added_at    TEXT,
     PRIMARY KEY (media_pk, idx)
 );
+CREATE TABLE IF NOT EXISTS agreement (
+    media_pk   TEXT PRIMARY KEY,
+    category   TEXT,
+    proposed   TEXT,
+    decided    TEXT,
+    decided_at TEXT
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -642,6 +649,34 @@ class State:
     def ai_meta_rows(self) -> list[sqlite3.Row]:
         with self._lock:
             return self.db.execute("SELECT * FROM ai_meta ORDER BY media_pk, idx").fetchall()
+
+    # ------------------------------------------------ згода з моделлю
+    def record_agreement(self, media_pk: str, proposed: str, decided: str) -> None:
+        """Що модель запропонувала і що вирішила людина — єдине чесне
+        калібрування, бо confidence у малих моделей — константа."""
+        meta = self.ai_meta(media_pk) or {}
+        with self._lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO agreement (media_pk, category, proposed, decided, decided_at)"
+                " VALUES (?,?,?,?,?)",
+                (str(media_pk), meta.get("category", ""), proposed, decided, _now()),
+            )
+            self.db.commit()
+
+    def agreement_stats(self) -> dict:
+        """{'total', 'agreed', 'by_category': {cat: (agreed, total)}}"""
+        with self._lock:
+            rows = self.db.execute("SELECT category, proposed, decided FROM agreement").fetchall()
+        total = agreed = 0
+        by_cat: dict = {}
+        for row in rows:
+            same = (row["proposed"] == "download") == (row["decided"] == "kept")
+            total += 1
+            agreed += int(same)
+            cat = row["category"] or "?"
+            a, t = by_cat.get(cat, (0, 0))
+            by_cat[cat] = (a + int(same), t + 1)
+        return {"total": total, "agreed": agreed, "by_category": by_cat}
 
     # ----------------------------------------------------- зразки описів
     def add_exemplar(self, media_pk: str, idx: int, description: str) -> None:

@@ -40,7 +40,8 @@ from ..vision import (
 from .review_tab import ReviewTab
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
-    DupeWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
+    DupeWorker, HealthWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
+    UrlWorker,
 )
 
 EAGLE_DEFAULT_URL = "http://localhost:41595"
@@ -202,6 +203,8 @@ class MainWindow(QMainWindow):
         self.describe_worker: Optional[DescribeWorker] = None
         self.normalize_worker: Optional[NormalizeWorker] = None
         self.dupe_worker: Optional[DupeWorker] = None
+        self.url_worker: Optional[UrlWorker] = None
+        self.health_worker: Optional[HealthWorker] = None
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1020, 720)
@@ -216,6 +219,7 @@ class MainWindow(QMainWindow):
         self._load_config_into_ui()
         self._refresh_status()
         QTimer.singleShot(300, self._startup_hints)
+        QTimer.singleShot(500, self._check_health)
 
     # ------------------------------------------------------------------ трей
     def _build_tray(self) -> None:
@@ -310,10 +314,35 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.btn_check_all)
         bar.addWidget(self.btn_uncheck_all)
         bar.addStretch(1)
+        self.btn_urls = QPushButton("За посиланням…")
+        self.btn_urls.setToolTip(
+            "Завантажити конкретні пости за адресами — той самий конвеєр:\n"
+            "завантаження → опис → Eagle, без обходу підбірок."
+        )
+        self.btn_urls.clicked.connect(self.on_download_urls)
+        bar.addWidget(self.btn_urls)
         self.btn_open_folder = QPushButton("Відкрити папку")
         self.btn_open_folder.clicked.connect(self.on_open_folder)
         bar.addWidget(self.btn_open_folder)
         layout.addLayout(bar)
+
+        # Швидкий старт: три індикатори того, без чого конвеєр не працює.
+        self.quick = QFrame()
+        self.quick.setProperty("role", "row")
+        quick = QHBoxLayout(self.quick)
+        quick.setContentsMargins(2, 0, 2, 0)
+        quick.setSpacing(14)
+        self.ind_session = self._indicator("Сесія", self._open_session_tab)
+        self.ind_eagle = self._indicator("Eagle", lambda: self._open_settings(4))
+        self.ind_model = self._indicator("Модель", lambda: self._open_settings(3))
+        for widget in (self.ind_session, self.ind_eagle, self.ind_model):
+            quick.addWidget(widget)
+        quick.addStretch(1)
+        self.btn_health = QPushButton("Перевірити")
+        self.btn_health.setToolTip("Ще раз запитати Eagle і LM Studio")
+        self.btn_health.clicked.connect(self._check_health)
+        quick.addWidget(self.btn_health)
+        layout.addWidget(self.quick)
 
         # Банер про невдалий попередній (зокрема фоновий) запуск
         self.banner = QFrame()
@@ -393,6 +422,104 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.btn_start)
         layout.addLayout(controls)
         return page
+
+    def _indicator(self, title: str, on_click) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        dot = QLabel("●")
+        dot.setProperty("role", "muted")
+        text = QLabel(f"{title}: …")
+        text.setProperty("role", "muted")
+        button = QPushButton("Налаштувати")
+        button.setFlat(True)
+        button.clicked.connect(on_click)
+        row.addWidget(dot)
+        row.addWidget(text)
+        row.addWidget(button)
+        box.dot, box.text, box.button = dot, text, button  # type: ignore[attr-defined]
+        return box
+
+    @staticmethod
+    def _set_indicator(box: QWidget, ok, title: str, detail: str) -> None:
+        role = "ok" if ok else ("muted" if ok is None else "err")
+        box.dot.setProperty("role", role)
+        box.dot.style().unpolish(box.dot)
+        box.dot.style().polish(box.dot)
+        box.text.setText(f"{title}: {detail}")
+        box.text.setToolTip(detail)
+        box.button.setVisible(not ok)
+
+    def _open_settings(self, page: int) -> None:
+        self.tabs.setCurrentIndex(1)
+        self.nav.setCurrentRow(page)
+
+    def _check_health(self) -> None:
+        if self.sessionid:
+            self._set_indicator(self.ind_session, True, "Сесія",
+                                f"@{self.username}" if self.username else "збережена")
+        else:
+            self._set_indicator(self.ind_session, False, "Сесія", "не підключена")
+        if not self.cfg.eagle_enabled:
+            self._set_indicator(self.ind_eagle, None, "Eagle", "імпорт вимкнено")
+        if self.health_worker and self.health_worker.isRunning():
+            return
+        self.health_worker = HealthWorker(self.cfg, self)
+        self.health_worker.done.connect(self._on_health)
+        self.health_worker.start()
+
+    def _on_health(self, result: dict) -> None:
+        ok, text = result.get("eagle", (False, "?"))
+        if self.cfg.eagle_enabled:
+            self._set_indicator(self.ind_eagle, ok, "Eagle", text if ok else "не відповідає")
+            self.ind_eagle.text.setToolTip(text)
+        ok, text = result.get("model", (None, "?"))
+        self._set_indicator(self.ind_model, ok, "Модель", text)
+
+    def on_download_urls(self) -> None:
+        """Другий вхід у конвеєр: конкретні пости за посиланнями."""
+        if not self._require_session():
+            return
+        if self.url_worker and self.url_worker.isRunning():
+            self.url_worker.stop()
+            self._log("Зупиняю завантаження за посиланнями…")
+            return
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Завантажити за посиланням")
+        dialog.resize(560, 300)
+        box = QVBoxLayout(dialog)
+        box.addWidget(_label(
+            "Адреси постів або reels — по одній на рядок. Пройдуть той самий шлях: "
+            "завантаження, опис моделлю, Eagle. У бібліотеці — полиця «За посиланням».",
+            "muted"))
+        editor = QPlainTextEdit()
+        editor.setPlaceholderText("https://www.instagram.com/reel/…\nhttps://www.instagram.com/p/…")
+        box.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        urls = [line.strip() for line in editor.toPlainText().splitlines()
+                if "instagram.com" in line]
+        if not urls:
+            self._log("Жодного посилання на Instagram.")
+            return
+        self._collect_ui_into_config()
+        self.cfg.save()
+        self.btn_start.setEnabled(False)
+        self.progress.setRange(0, len(urls))
+        self.progress.setFormat("За посиланням…")
+        self._log(f"═══ За посиланням: {len(urls)} ═══")
+        self.url_worker = UrlWorker(self.cfg, self.state, self.sessionid, urls, self)
+        self.url_worker.line.connect(self._log)
+        self.url_worker.progress.connect(self._on_progress)
+        self.url_worker.done.connect(self._on_sync_done)
+        self.url_worker.start()
 
     # ------------------------------------------------------------- вкладка 2
     def _tab_settings(self) -> QWidget:
@@ -2329,6 +2456,12 @@ class MainWindow(QMainWindow):
         return False
 
     def _refresh_status(self) -> None:
+        if hasattr(self, "ind_session"):
+            if self.sessionid:
+                self._set_indicator(self.ind_session, True, "Сесія",
+                                    f"@{self.username}" if self.username else "збережена")
+            else:
+                self._set_indicator(self.ind_session, False, "Сесія", "не підключена")
         if self.username:
             self.status_label.setText(f"@{self.username}")
             self.status_label.setProperty("role", "ok")

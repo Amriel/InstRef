@@ -35,15 +35,18 @@ from typing import Callable, List, Optional
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QCompleter, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from .. import frames as framegrab
 from ..config import Config
 from ..state import REVIEW_MODEL, REVIEW_RULES, State
 
 CARD_W = 300
-THUMB_W, THUMB_H = 268, 336   # вертикальний кадр Reels як орієнтир
+THUMB_W, THUMB_H = 268, 300   # вертикальний кадр Reels як орієнтир
+STRIP_FRAMES = 4
+STRIP_H = 48
 
 KEPT = "kept"
 DROPPED = "dropped"
@@ -110,18 +113,83 @@ class Preview(QLabel):
         super().mouseDoubleClickEvent(event)
 
 
+def filmstrip(media_path: str, cache_dir: Optional[Path] = None) -> Optional[QPixmap]:
+    """Кілька кадрів ролика в один рядок — щоб бачити рух, а не одну обкладинку.
+
+    Кешується поруч із превʼю: декодувати ролик на кожне перемальовування
+    сітки — це секунди на картку.
+    """
+    path = Path(media_path or "")
+    if not path.exists() or path.suffix.lower() not in framegrab.VIDEO_EXT:
+        return None
+    cached = None
+    if cache_dir is not None:
+        cached = cache_dir / f"{path.stem}_strip.jpg"
+        if cached.exists():
+            pixmap = QPixmap(str(cached))
+            if not pixmap.isNull():
+                return pixmap
+    shots = framegrab.extract(path, STRIP_FRAMES, max_side=200, by_scene=True)
+    if not shots:
+        return None
+    try:
+        import cv2
+        import numpy as np
+
+        tiles = []
+        tile_w = THUMB_W // STRIP_FRAMES
+        for shot in shots:
+            image = cv2.imdecode(np.frombuffer(shot, np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                continue
+            height, width = image.shape[:2]
+            scale = STRIP_H / height
+            resized = cv2.resize(image, (max(1, int(width * scale)), STRIP_H))
+            if resized.shape[1] > tile_w:
+                start = (resized.shape[1] - tile_w) // 2
+                resized = resized[:, start:start + tile_w]
+            else:
+                pad = tile_w - resized.shape[1]
+                resized = cv2.copyMakeBorder(resized, 0, 0, pad // 2, pad - pad // 2,
+                                             cv2.BORDER_CONSTANT, value=(20, 20, 20))
+            tiles.append(resized)
+        if not tiles:
+            return None
+        strip = np.concatenate(tiles, axis=1)
+        ok, buffer = cv2.imencode(".jpg", strip, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ok:
+            return None
+        data = buffer.tobytes()
+        if cached is not None:
+            try:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                cached.write_bytes(data)
+            except OSError:
+                pass
+        pixmap = QPixmap()
+        pixmap.loadFromData(data, "JPG")
+        return pixmap if not pixmap.isNull() else None
+    except Exception:  # noqa: BLE001 — кадрострічка не варта зламаної вкладки
+        return None
+
+
 class ReviewCard(QFrame):
-    def __init__(self, row, on_decide: Callable[[str, str, str], None]):
+    def __init__(self, row, on_decide: Callable[[str, str, str], None],
+                 state: Optional[State] = None, tag_words: Optional[List[str]] = None,
+                 strip_cache: Optional[Path] = None):
         super().__init__()
         self.setProperty("role", "card")
         self.setFixedWidth(CARD_W)
         self.media_pk = str(row["media_pk"])
         self.username = row["username"] or ""
         self.url = row["url"] or ""
+        self.path = row["path"] or ""
         # Пропозиція є лише там, де рішення прийняла модель. Для решти позначки
         # немає — і це теж інформація: значить, вирішувати цілком тобі.
         self.proposal = (row["verdict"] or "") if _source_of(row) == REVIEW_MODEL else ""
         self._on_decide = on_decide
+        self._state = state
+        self._idx = state.file_index(self.path) if (state and self.path) else 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 12)
@@ -129,6 +197,14 @@ class ReviewCard(QFrame):
 
         layout.addWidget(Preview(row["thumb"] or row["path"], row["path"]),
                          alignment=Qt.AlignHCenter)
+
+        strip = filmstrip(self.path, strip_cache)
+        if strip is not None:
+            strip_label = QLabel()
+            strip_label.setPixmap(strip)
+            strip_label.setFixedSize(THUMB_W, STRIP_H)
+            strip_label.setToolTip("Кадри ролика за сценами")
+            layout.addWidget(strip_label, alignment=Qt.AlignHCenter)
 
         head = QHBoxLayout()
         author = QLabel(f"@{self.username}" if self.username else "невідомий автор")
@@ -159,6 +235,40 @@ class ReviewCard(QFrame):
         reason.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         reason.setToolTip(row["reason"] or "")
         layout.addWidget(reason)
+
+        # Опис і теги моделі — тут, де видно помилку, їх і правлять. У Eagle
+        # піде вже виправлене: імпорт читає ai_meta у момент «Залишити».
+        meta = (state.ai_meta(self.media_pk, self._idx) if state else None) or {}
+        self.ed_description = QPlainTextEdit()
+        self.ed_description.setPlaceholderText("опис від моделі — можна правити")
+        self.ed_description.setPlainText(meta.get("description", ""))
+        self.ed_description.setFixedHeight(64)
+        self.ed_description.setToolTip("Опис піде в анотацію Eagle і в метадані файлу")
+        layout.addWidget(self.ed_description)
+
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(6)
+        self.ed_tags = QLineEdit()
+        self.ed_tags.setPlaceholderText("теги через кому")
+        self.ed_tags.setText(", ".join(
+            t for t in meta.get("tags", []) if t != "autotagged"))
+        self.ed_tags.setToolTip("Теги зі словника; Tab — автодоповнення")
+        if tag_words:
+            completer = QCompleter(sorted(set(tag_words)))
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            self.ed_tags.setCompleter(completer)
+        tag_row.addWidget(self.ed_tags, 1)
+        self.btn_star = QPushButton("★")
+        self.btn_star.setFixedWidth(34)
+        self.btn_star.setCheckable(True)
+        self.btn_star.setChecked(bool(state and state.is_exemplar(self.media_pk, self._idx)))
+        self.btn_star.setToolTip(
+            "Гарний опис — взяти за зразок. Кілька таких підставляються в "
+            "інструкцію моделі, і наступні описи рівняються на них."
+        )
+        self.btn_star.toggled.connect(self._toggle_star)
+        tag_row.addWidget(self.btn_star)
+        layout.addLayout(tag_row)
 
         if self.proposal:
             badge = QLabel(
@@ -204,7 +314,41 @@ class ReviewCard(QFrame):
         layout.addLayout(bottom)
 
     def _decide(self, decision: str, list_action: str) -> None:
+        self.save_edits()
         self._on_decide(self.media_pk, decision, list_action)
+
+    def save_edits(self) -> None:
+        """Правки опису й тегів — у базу, звідки їх прочитає імпорт у Eagle."""
+        if self._state is None:
+            return
+        from ..taxonomy import clean_token
+
+        description = " ".join(self.ed_description.toPlainText().split())
+        tags = [clean_token(t) for t in self.ed_tags.text().split(",")]
+        tags = [t for t in tags if t]
+        meta = self._state.ai_meta(self.media_pk, self._idx) or {}
+        old_tags = [t for t in meta.get("tags", []) if t != "autotagged"]
+        if description == meta.get("description", "") and tags == old_tags:
+            return
+        if tags and "autotagged" in meta.get("tags", []):
+            tags.append("autotagged")
+        self._state.update_ai_text(self.media_pk, self._idx, description, tags)
+        if self.btn_star.isChecked() and description:
+            self._state.add_exemplar(self.media_pk, self._idx, description)
+
+    def _toggle_star(self, checked: bool) -> None:
+        if self._state is None:
+            return
+        description = " ".join(self.ed_description.toPlainText().split())
+        if checked and description:
+            self._state.add_exemplar(self.media_pk, self._idx, description)
+        elif not checked:
+            self._state.remove_exemplar(self.media_pk, self._idx)
+
+    def set_current(self, current: bool) -> None:
+        """Підсвітка картки, на якій стоїть клавіатурний курсор."""
+        self.setStyleSheet(
+            "QFrame[role=\"card\"] { border: 2px solid #6ea8fe; }" if current else "")
 
     def _open_url(self) -> None:
         if self.url:
@@ -222,6 +366,9 @@ class ReviewTab(QWidget):
         self._cards: List[ReviewCard] = []
         self._columns = 0
         self._pending_total = 0
+        self._current = -1
+        self._tag_words = self._load_tag_words()
+        self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -258,11 +405,20 @@ class ReviewTab(QWidget):
             "Усе, що чекає на твоє око. Позначка «◆ модель» означає, що рішення "
             "вже прийнято за тебе і його лишається підтвердити або скасувати; "
             "без позначки — правила не змогли вирішити. У Eagle нічого не піде, "
-            "доки не натиснеш «Залишити». Подвійний клік по картинці відкриває файл."
+            "доки не натиснеш «Залишити». Подвійний клік по картинці відкриває файл. "
+            "Клавіатура: стрілки — рух, Y — залишити, N — не качати, O — відкрити."
         )
         self.hint.setWordWrap(True)
         self.hint.setProperty("role", "muted")
         layout.addWidget(self.hint)
+
+        self.stats_label = QLabel("")
+        self.stats_label.setProperty("role", "hint")
+        self.stats_label.setToolTip(
+            "Скільки разів ти погодився з моделлю. Це і є її справжня точність — "
+            "confidence у малих моделей завжди однакова."
+        )
+        layout.addWidget(self.stats_label)
 
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
@@ -298,12 +454,92 @@ class ReviewTab(QWidget):
         self._pending_total = len(rows)
         columns = self._fit_columns()
         for index, row in enumerate(rows[:MAX_CARDS]):
-            card = ReviewCard(row, self._decide)
+            card = self._make_card(row)
             self.grid.addWidget(card, index // columns, index % columns)
             self._cards.append(card)
         self._columns = columns
+        self._current = 0 if self._cards else -1
+        self._highlight()
         self._update_title()
         self._enable_bulk(bool(rows))
+        self._update_stats()
+
+    def _make_card(self, row) -> ReviewCard:
+        return ReviewCard(row, self._decide, state=self.state, tag_words=self._tag_words,
+                          strip_cache=self.cfg.thumbs_dir)
+
+    def _load_tag_words(self) -> List[str]:
+        try:
+            from ..taxonomy import Taxonomy
+
+            return Taxonomy.load().all_tags()
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _update_stats(self) -> None:
+        stats = self.state.agreement_stats()
+        if not stats["total"]:
+            self.stats_label.setText("")
+            return
+        percent = 100 * stats["agreed"] // stats["total"]
+        parts = []
+        for cat, (agreed, total) in sorted(stats["by_category"].items(), key=lambda x: -x[1][1]):
+            parts.append(f"{cat} {100 * agreed // total}% ({total})")
+        self.stats_label.setText(
+            f"Згода з моделлю: {percent}% з {stats['total']} рішень · " + " · ".join(parts[:5]))
+
+    # ------------------------------------------------------- клавіатура
+    def _highlight(self) -> None:
+        for index, card in enumerate(self._cards):
+            card.set_current(index == self._current)
+        if 0 <= self._current < len(self._cards):
+            self.area.ensureWidgetVisible(self._cards[self._current])
+
+    def current_card(self) -> Optional[ReviewCard]:
+        if 0 <= self._current < len(self._cards):
+            return self._cards[self._current]
+        return None
+
+    def move_cursor(self, delta: int) -> None:
+        if not self._cards:
+            return
+        self._current = max(0, min(len(self._cards) - 1, self._current + delta))
+        self._highlight()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 — Qt API
+        key = event.key()
+        columns = max(1, self._columns)
+        focus = self.focusWidget()
+        # Стрілки й літери в полі опису — це редагування, а не трияж.
+        typing = isinstance(focus, (QPlainTextEdit, QLineEdit))
+        card = self.current_card()
+        if key == Qt.Key_Escape and typing:
+            self.setFocus()
+        elif typing:
+            super().keyPressEvent(event)
+            return
+        elif key in (Qt.Key_Right, Qt.Key_L):
+            self.move_cursor(1)
+        elif key in (Qt.Key_Left, Qt.Key_H):
+            self.move_cursor(-1)
+        elif key in (Qt.Key_Down, Qt.Key_J):
+            self.move_cursor(columns)
+        elif key in (Qt.Key_Up, Qt.Key_K):
+            self.move_cursor(-columns)
+        elif key == Qt.Key_Y and card is not None:
+            card._decide(KEPT, "")
+        elif key == Qt.Key_N and card is not None:
+            card._decide(DROPPED, "")
+        elif key == Qt.Key_O and card is not None:
+            path = Path(card.path)
+            if path.exists() and _may_open():
+                _open_path(path)
+        elif key == Qt.Key_S and card is not None:
+            card.btn_star.toggle()
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
 
     def _enable_bulk(self, enabled: bool) -> None:
         self.btn_keep_all.setEnabled(enabled)
@@ -351,15 +587,18 @@ class ReviewTab(QWidget):
             if len(self._cards) >= MAX_CARDS:
                 break
             if str(row["media_pk"]) not in shown:
-                self._cards.append(ReviewCard(row, self._decide))
+                self._cards.append(self._make_card(row))
                 break
 
         columns = self._columns or 1
         for index, existing in enumerate(self._cards):
             self.grid.addWidget(existing, index // columns, index % columns)
 
+        self._current = min(self._current, len(self._cards) - 1) if self._cards else -1
+        self._highlight()
         self._update_title()
         self._enable_bulk(bool(self._cards))
+        self._update_stats()
         bar.setValue(min(position, bar.maximum()))
 
     def _fit_columns(self) -> int:
@@ -402,6 +641,8 @@ class ReviewTab(QWidget):
         else:
             self._drop(row)
 
+        if _source_of(row) == REVIEW_MODEL and row["verdict"]:
+            self.state.record_agreement(media_pk, row["verdict"], decision)
         self.state.decide_review(media_pk, decision)
         self._drop_card(media_pk)
 
@@ -431,13 +672,17 @@ class ReviewTab(QWidget):
             if answer != QMessageBox.Yes:
                 return
 
+        for card in self._cards:
+            card.save_edits()
         for row in rows:
             if (row["verdict"] or "") == PROPOSE_DROP:
                 self._drop(row)
-                self.state.decide_review(str(row["media_pk"]), DROPPED)
+                decision = DROPPED
             else:
                 self._keep(row)
-                self.state.decide_review(str(row["media_pk"]), KEPT)
+                decision = KEPT
+            self.state.record_agreement(str(row["media_pk"]), row["verdict"], decision)
+            self.state.decide_review(str(row["media_pk"]), decision)
         self.log(f"Рішення моделі прийнято для {len(rows)} пост(ів)")
         self.reload()
 

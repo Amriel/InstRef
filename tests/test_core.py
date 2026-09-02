@@ -3705,3 +3705,36 @@ def test_eagle_item_ids_are_learned_from_the_listing(tmp_path, monkeypatch):
         assert state.eagle_item_ids() == {"1": "E1"}
     finally:
         state.close()
+
+
+def test_run_urls_feeds_the_same_pipeline(tmp_path, monkeypatch):
+    """Другий вхід у конвеєр: конкретні пости за посиланням, без обходу."""
+    from igsaved import sync as sync_mod
+    from igsaved.config import MANUAL_PK
+
+    engine, cfg, state = _engine(tmp_path, eagle_enabled=False, vision_enabled=False)
+    try:
+        monkeypatch.setattr(sync_mod, "LOCK_PATH", tmp_path / "sync.lock")
+        monkeypatch.setattr(engine.ig, "connect", lambda sid: "me")
+        monkeypatch.setattr(engine.ig, "pause", lambda: None)
+        posts = {"https://www.instagram.com/p/AAA/": _post(caption="ref", pk=1),
+                 "https://www.instagram.com/p/BBB/": _post(caption="ref", pk=2)}
+
+        def from_url(url):
+            if url not in posts:
+                from igsaved.instagram import InstagramError
+                raise InstagramError(f"Не вдалось узяти пост {url}")
+            return posts[url]
+
+        monkeypatch.setattr(engine.ig, "media_from_url", from_url)
+        taken = []
+        monkeypatch.setattr(engine, "_process_media",
+                            lambda media, col, verdict=None: taken.append((media.pk, col.pk)))
+        stats = engine.run_urls(list(posts) + ["https://www.instagram.com/p/NOPE/"])
+        assert [t[0] for t in taken] == ["1", "2"]
+        assert all(t[1] == MANUAL_PK for t in taken)
+        assert stats.failed == 1 and stats.scanned == 3
+        assert state.collection_pks_for("1") == [MANUAL_PK]
+        assert state.last_runs(1)[0]["note"] == "за посиланням"
+    finally:
+        state.close()

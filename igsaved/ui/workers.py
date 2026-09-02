@@ -217,6 +217,74 @@ class CleanupWorker(QThread):
             self.cfg, self.state, log=self.line.emit, should_stop=lambda: self._stop))
 
 
+class UrlWorker(QThread):
+    """Завантаження конкретних постів за посиланнями."""
+
+    line = Signal(str)
+    progress = Signal(str, int, int)
+    done = Signal(object)  # Stats
+
+    def __init__(self, cfg: Config, state: State, sessionid: str,
+                 urls: List[str], parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.state = state
+        self.sessionid = sessionid
+        self.urls = urls
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        engine = SyncEngine(
+            self.cfg, self.state, self.sessionid, log=self.line.emit,
+            progress=lambda msg, cur, total: self.progress.emit(msg, cur, total),
+            should_stop=lambda: self._stop,
+        )
+        self.done.emit(engine.run_urls(self.urls))
+
+
+class HealthWorker(QThread):
+    """Чи відповідають Eagle і LM Studio — для індикаторів «швидкого старту»."""
+
+    done = Signal(object)  # dict(eagle=(ok, text), model=(ok, text))
+
+    def __init__(self, cfg: Config, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+
+    def run(self) -> None:
+        from ..eagle import EagleClient, EagleError
+        from .. import vision
+
+        result = {}
+        try:
+            info = EagleClient(self.cfg.eagle_url, self.cfg.eagle_token, timeout=3).ping()
+            version = info.get("version") if isinstance(info, dict) else ""
+            result["eagle"] = (True, f"Eagle {version}".strip())
+        except EagleError as exc:
+            result["eagle"] = (False, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            result["eagle"] = (False, str(exc))
+        if not self.cfg.vision_enabled:
+            result["model"] = (None, "вимкнено")
+        else:
+            try:
+                client = vision.client_for(self.cfg)
+                models = client.list_models()
+                if not models:
+                    result["model"] = (False, "модель не завантажена")
+                else:
+                    chosen = self.cfg.vision_model or models[0]
+                    result["model"] = (True, chosen)
+            except vision.VisionError as exc:
+                result["model"] = (False, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                result["model"] = (False, str(exc))
+        self.done.emit(result)
+
+
 class SyncWorker(QThread):
     """Повний прохід синхронізації."""
 

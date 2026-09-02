@@ -258,6 +258,22 @@ class IGClient:
                 return
             self.pause()
 
+    def media_from_url(self, url: str):
+        """Один пост за посиланням — другий вхід у той самий конвеєр."""
+        url = (url or "").strip()
+        if not url:
+            raise InstagramError("Порожнє посилання.")
+        try:
+            pk = self.client.media_pk_from_url(url)
+            return self.client.media_info(pk)
+        except Exception as exc:  # noqa: BLE001
+            kind = classify_error(exc)
+            if kind is RateLimited:
+                raise RateLimited(f"Instagram попросив зупинитись: {_short(exc)}") from exc
+            if kind is SessionDead:
+                raise SessionDead(f"Сесія Instagram більше не дійсна: {_short(exc)}") from exc
+            raise InstagramError(f"Не вдалось узяти пост {url}: {_short(exc)}") from exc
+
     def pause(self) -> None:
         low, high = self.delay_range
         time.sleep(random.uniform(float(low), float(high)))

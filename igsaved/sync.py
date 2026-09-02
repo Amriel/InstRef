@@ -15,7 +15,9 @@ from . import frames as framegrab
 from . import taxonomy
 from . import vision
 from .classify import DOWNLOAD, REVIEW, SKIP, Rules
-from .config import Config, DEVICE_PATH, LOCK_PATH, STRUCTURE_PER_COLLECTION
+from .config import (
+    Config, DEVICE_PATH, LOCK_PATH, MANUAL_NAME, MANUAL_PK, STRUCTURE_PER_COLLECTION,
+)
 from .downloader import Downloader, TooLarge, human_size
 from .eagle import EagleClient, EagleError, EagleItem
 from .instagram import (
@@ -252,6 +254,105 @@ class SyncEngine:
             self.state.finish_run(
                 run_id, self.stats.scanned, self.stats.downloaded,
                 self.stats.skipped, self.stats.failed, note,
+            )
+        return self.stats
+
+    def run_urls(self, urls: List[str]) -> Stats:
+        """Завантажити конкретні пости за посиланнями — без обходу підбірок.
+
+        Кулдаун між проходами тут не діє (це кілька запитів, а не обхід), але
+        примусова пауза після «зачекай» і замок — так.
+        """
+        forced = self.state.cooldown_until()
+        if forced is not None:
+            self.log("Instagram попросив зупинитись — посилання почекають до кінця паузи.")
+            self.stats.errors.append("cooldown")
+            self.stats.reason = "cooldown"
+            return self.stats
+        wanted = [u.strip() for u in urls if u and u.strip()]
+        if not wanted:
+            self.log("Жодного посилання.")
+            return self.stats
+        lock = RunLock(LOCK_PATH)
+        try:
+            lock.acquire()
+        except LockHeld as exc:
+            self.log(f"Пропускаю: {exc}")
+            self.stats.errors.append("locked")
+            self.stats.reason = "locked"
+            return self.stats
+        run_id = self.state.start_run()
+        note = ""
+        col = CollectionInfo(MANUAL_PK, MANUAL_NAME, len(wanted))
+        try:
+            self.ig.connect(self.sessionid)
+            self._setup_eagle()
+            self._vision = self._setup_vision()
+            self.cfg.root.mkdir(parents=True, exist_ok=True)
+            self.state.upsert_collection(col.pk, col.display, 0)
+            for position, url in enumerate(wanted, start=1):
+                if self.should_stop():
+                    note = "зупинено користувачем"
+                    break
+                self.progress(f"посилання {position}/{len(wanted)}", position, len(wanted))
+                self.stats.scanned += 1
+                try:
+                    media = self.ig.media_from_url(url)
+                except RateLimited:
+                    raise
+                except InstagramError as exc:
+                    self.stats.failed += 1
+                    self.stats.errors.append(str(exc))
+                    self.log(f"   ✖ {exc}")
+                    continue
+                pk = str(getattr(media, "pk", "") or "")
+                if not pk:
+                    self.stats.failed += 1
+                    continue
+                self.state.add_membership(pk, col.pk, col.display)
+                if self.state.is_known(pk):
+                    self.stats.skipped += 1
+                    self.log(f"   вже є: {url}")
+                    self._queue_eagle_existing(media, col)
+                    continue
+                try:
+                    self._process_media(media, col)
+                    self.state.clear_failures(pk)
+                except RateLimited:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self._note_failure(media, pk, exc)
+                if position < len(wanted):
+                    self.ig.pause()
+            self._flush_eagle()
+            self.log(f"Готово: {self.stats.summary()}")
+        except RateLimited as exc:
+            note = self._enter_rate_limit(exc)
+        except SessionDead as exc:
+            note = str(exc)
+            self.stats.errors.append(note)
+            self.stats.reason = "session_dead"
+            self.log(f"✖ {note}")
+        except InstagramError as exc:
+            note = str(exc)
+            self.stats.errors.append(note)
+            self.log(f"✖ {note}")
+        except Exception as exc:  # noqa: BLE001
+            note = f"{exc.__class__.__name__}: {exc}"
+            self.stats.errors.append(note)
+            self.log(f"✖ Несподівана помилка: {note}")
+            self.log(traceback.format_exc(limit=4))
+        finally:
+            try:
+                self._flush_eagle()
+            except Exception:  # noqa: BLE001
+                pass
+            self._clear_cache()
+            self.dl.close()
+            lock.release()
+            self.state.finish_run(
+                run_id, self.stats.scanned, self.stats.downloaded,
+                self.stats.skipped, self.stats.failed, note or "за посиланням",
             )
         return self.stats
 

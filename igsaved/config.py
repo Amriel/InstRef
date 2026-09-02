@@ -59,6 +59,11 @@ ALL_POSTS_NAME = "All Posts"
 LIKED_PK = "liked"
 LIKED_NAME = "Пролайкане"
 
+# Пости, взяті за посиланням, — теж псевдо-підбірка: у Eagle їм потрібна
+# власна полиця, а в базі — членство, як у всіх.
+MANUAL_PK = "manual"
+MANUAL_NAME = "За посиланням"
+
 STRUCTURE_FLAT = "flat"
 STRUCTURE_PER_COLLECTION = "per_collection"
 
