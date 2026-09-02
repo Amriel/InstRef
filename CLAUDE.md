@@ -106,6 +106,10 @@ python -m pytest tests/ -q | tail -1        # кількість тестів у
   копії.** Одного разу `origin` зник після доставки, і `git push` упав із
   «'origin' does not appear to be a git repository». У контейнері:
   `git remote add origin https://github.com/Amriel/InstRef.git`.
+* **Понад три теги одним push — GitHub не запускає workflow.** Так задумано
+  на їхньому боці. Тег для релізу пушити окремо: `git push origin vX.Y.Z`;
+  якщо вже поїхав пачкою — видалити (`git push origin :refs/tags/vX.Y.Z`)
+  і запушити знову.
 * **Перед перезаписом `.git` на диску користувача — звірити HEAD.** Доставка
   переписує `.git` з контейнерної копії; власний коміт користувача вона затре
   мовчки. Тому спершу `cat .git/refs/heads/main` на диску: він має дорівнювати
