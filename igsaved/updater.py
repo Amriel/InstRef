@@ -85,15 +85,30 @@ def update_installed(latest: dict, progress: Progress = lambda *a: None) -> str:
     if asset.get("size") and target.stat().st_size != int(asset["size"]):
         raise UpdateError("Інсталятор завантажився не повністю — спробуй ще раз.")
     progress("Запуск інсталятора…", 1, 1)
+    launch_installer_and_relaunch(target, Path(sys.executable))
+    return str(target)
+
+
+def launch_installer_and_relaunch(installer: Path, app_exe: Path) -> None:
+    """Тихий інсталятор, а після нього — знову застосунок.
+
+    На інсталятор тут не покладаємось: у тихому режимі він не запускає програму
+    (`skipifsilent`), а «/RESTARTAPPLICATIONS» перезапускає лише те, що сам і
+    закрив — ми ж виходимо самі. Тому окремий невидимий cmd: чекає, доки
+    застосунок вийде, запускає інсталятор синхронно і потім — новий .exe.
+    """
+    if sys.platform != "win32":
+        raise UpdateError("Інсталятор — лише для Windows.")
+    script = (
+        f'timeout /t 2 /nobreak >nul & '
+        f'"{installer}" /SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /NORESTART & '
+        f'start "" "{app_exe}"'
+    )
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
-        subprocess.Popen(
-            [str(target), "/SILENT", "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS",
-             "/RESTARTAPPLICATIONS", "/NORESTART"],
-            close_fds=True,
-        )
+        subprocess.Popen(["cmd", "/c", script], creationflags=flags, close_fds=True)
     except OSError as exc:
         raise UpdateError(f"Не вдалось запустити інсталятор: {exc}") from exc
-    return str(target)
 
 
 # ------------------------------------------------------------- з вихідників

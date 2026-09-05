@@ -47,36 +47,37 @@ jobs:
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
 
-      - name: Write release notes from commit messages
-        # GitHub без pull request'ів генерує лише посилання «Full Changelog».
-        # Нотатки складаємо самі: заголовки комітів від попереднього тегу,
-        # без службових трейлерів.
+      - name: Write release notes
+        # Джерело — CHANGELOG.md: розділ для цієї версії, написаний для людей.
+        # Коміти між тегами — під спойлером; якщо розділу немає, вони ж і є
+        # нотатками, щоб реліз не вийшов порожнім.
         shell: bash
         run: |
+          version="${{ steps.version.outputs.value }}"
           current="${GITHUB_REF_NAME}"
           previous=$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true)
+          section=$(awk -v v="$version" '
+            $0 ~ "^## " { grab = ($2 == v) ; next }
+            grab { print }
+          ' CHANGELOG.md | sed -e '1{/^$/d}' -e '${/^$/d}')
           {
-            echo "## InstRef ${{ steps.version.outputs.value }}"
+            echo "## InstRef ${version}"
             echo
-            if [ -n "$previous" ]; then
-              range="${previous}..${current}"
-              echo "Changes since ${previous}:"
+            if [ -n "$section" ]; then
+              echo "$section"
             else
-              range="${current}"
-              echo "Changes:"
+              echo "No CHANGELOG entry for this version; changes from commit messages:"
+              echo
+              git log "${previous:+$previous..}${current}" --no-merges --pretty='- %s'
             fi
             echo
-            git log "$range" --no-merges --pretty='- %s' \
-              | grep -viE '^- (docs|ci|build|tests?|chore)(\(|:)' || true
+            echo "<details><summary>Commits</summary>"
             echo
-            echo "<details><summary>Housekeeping</summary>"
-            echo
-            git log "$range" --no-merges --pretty='- %s' \
-              | grep -iE '^- (docs|ci|build|tests?|chore)(\(|:)' || echo "- —"
+            git log "${previous:+$previous..}${current}" --no-merges --pretty='- %s' || echo "- —"
             echo
             echo "</details>"
-            echo
             if [ -n "$previous" ]; then
+              echo
               echo "Full diff: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${current}"
             fi
           } > release_notes.md

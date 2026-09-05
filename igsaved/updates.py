@@ -70,8 +70,9 @@ def installer_asset(latest: dict) -> Optional[dict]:
 def plain_notes(markdown: str) -> str:
     """Нотатки релізу без розмітки: жирного, заголовків, <details>."""
     text = str(markdown or "")
-    text = re.sub(r"<details>.*?<summary>(.*?)</summary>", r"\1:", text, flags=re.S)
-    text = re.sub(r"</?details>", "", text)
+    # Коміти під спойлером — для GitHub; людині в застосунку вони не потрібні.
+    text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
+    text = re.sub(r"^Full diff:.*$", "", text, flags=re.M)
     text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
     text = text.replace("**", "").replace("`", "")
     text = re.sub(r"\n{3,}", "\n\n", text)

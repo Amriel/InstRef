@@ -3815,3 +3815,22 @@ def test_text_model_is_recognised_and_not_preferred():
     # маркер словника сам по собі — не текст, і зберігати такий «опис» не можна
     assert not VisionVerdict(tags=["autotagged"]).has_text
     assert VisionVerdict(tags=["cgi", "autotagged"]).has_text
+
+
+def test_installed_update_relaunches_the_app_after_the_installer(monkeypatch, tmp_path):
+    """Після оновлення застосунок не запускався назад: тихий інсталятор не
+    запускає програму, а сам застосунок уже вийшов. Помічник робить це за них."""
+    import subprocess
+
+    from igsaved import updater
+
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: calls.append((args, kw)))
+    updater.launch_installer_and_relaunch(tmp_path / "InstRef-Setup-9.exe", tmp_path / "InstRef.exe")
+    args, kwargs = calls[0]
+    assert args[:2] == ["cmd", "/c"]
+    script = args[2]
+    assert "InstRef-Setup-9.exe" in script and "/SILENT" in script
+    assert script.index("Setup") < script.index('start "" ')     # спершу інсталятор, потім застосунок
+    assert "InstRef.exe" in script.split('start "" ')[1]
