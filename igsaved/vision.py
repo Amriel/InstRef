@@ -51,6 +51,22 @@ SAFE_FRAMES = 12
 MAX_TAGS = 15
 
 
+# Ознаки візуальної моделі в її назві. Текстова модель приймає запит з
+# картинками мовчки і відповідає про те, чого не бачила, — порожній JSON або
+# фантазія за підписом. Тому назву перевіряємо до, а не після.
+VISUAL_MARKS = ("vl", "vision", "llava", "moondream", "pixtral", "minicpm-v", "idefics",
+                "gemma-3", "gemma3", "florence", "internvl", "phi-3-vision", "phi-3.5-vision",
+                "phi-4-multimodal", "smolvlm", "molmo", "qvq", "4o", "omni", "vlm")
+
+
+def looks_visual(model_id: str) -> bool:
+    """Чи схожа назва моделі на візуальну. Евристика, але дешева й чесна."""
+    name = (model_id or "").lower()
+    if not name:
+        return True   # невідомо — не лякаємо
+    return any(mark in name for mark in VISUAL_MARKS)
+
+
 def normalize_url(url: str) -> str:
     """Дописує /v1, якщо його немає.
 
@@ -239,8 +255,13 @@ class VisionVerdict:
 
     @property
     def has_text(self) -> bool:
-        """Чи є що покласти у файл, навіть якщо категорія не переконала."""
-        return bool(self.description or self.tags)
+        """Чи є що покласти у файл, навіть якщо категорія не переконала.
+
+        Самий лише маркер «autotagged» — не теги: словник дописує його завжди,
+        і без цієї перевірки порожня відповідь виглядала б як опис.
+        """
+        real_tags = [t for t in self.tags if t and t != "autotagged"]
+        return bool(self.description or real_tags)
 
     def short_description(self, limit: int = 140) -> str:
         text = " ".join(self.description.split())
@@ -295,13 +316,17 @@ class VisionClient:
         return [str(item.get("id")) for item in (items or []) if item.get("id")]
 
     def resolve_model(self) -> str:
-        """Якщо модель не вказана — беремо першу завантажену."""
+        """Якщо модель не вказана — беремо першу завантажену, що виглядає візуальною.
+
+        Перша в списку буває текстовою: тоді картинки летять у порожнечу.
+        """
         if self.model:
             return self.model
         models = self.list_models()
         if not models:
             raise VisionError("У LM Studio не завантажено жодної моделі.")
-        self.model = models[0]
+        visual = [m for m in models if looks_visual(m)]
+        self.model = (visual or models)[0]
         return self.model
 
     # ---------------------------------------------------------- класифікація

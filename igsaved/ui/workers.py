@@ -276,8 +276,12 @@ class HealthWorker(QThread):
                 if not models:
                     result["model"] = (False, "модель не завантажена")
                 else:
-                    chosen = self.cfg.vision_model or models[0]
-                    result["model"] = (True, chosen)
+                    chosen = self.cfg.vision_model or next(
+                        (m for m in models if vision.looks_visual(m)), models[0])
+                    if vision.looks_visual(chosen):
+                        result["model"] = (True, chosen)
+                    else:
+                        result["model"] = (False, f"{chosen} — текстова, кадрів не побачить")
             except vision.VisionError as exc:
                 result["model"] = (False, str(exc))
             except Exception as exc:  # noqa: BLE001

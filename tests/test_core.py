@@ -3797,3 +3797,21 @@ def test_installer_asset_is_picked_from_release_assets():
                          {"name": "InstRef-Setup-2.4.0.exe", "url": "e", "size": 5}]}
     assert installer_asset(latest)["url"] == "e"
     assert installer_asset({"assets": []}) is None
+
+
+def test_text_model_is_recognised_and_not_preferred():
+    """qwen3.8-27b у полі «Модель» — і жодного опису: текстова модель кадрів не бачить."""
+    from igsaved.vision import VisionClient, VisionVerdict, looks_visual
+
+    assert looks_visual("qwen3-vl-4b-instruct")
+    assert looks_visual("gemma-3-12b-it")
+    assert not looks_visual("qwen3.8-27b")
+    assert not looks_visual("llama-3.1-8b-instruct")
+
+    client = VisionClient(model="")
+    client.list_models = lambda: ["qwen3.8-27b", "qwen3-vl-4b-instruct"]
+    assert client.resolve_model() == "qwen3-vl-4b-instruct"
+
+    # маркер словника сам по собі — не текст, і зберігати такий «опис» не можна
+    assert not VisionVerdict(tags=["autotagged"]).has_text
+    assert VisionVerdict(tags=["cgi", "autotagged"]).has_text

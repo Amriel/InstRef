@@ -464,6 +464,12 @@ class SyncEngine:
             self.log(f"Візуальна модель пропущена: {exc} Працюю за правилами.")
             return None
         self._vision_model = model
+        if not vision.looks_visual(model):
+            self.log(
+                f"⚠ Модель «{model}» виглядає текстовою: вона не побачить кадрів і "
+                "описів не буде. Обери візуальну (наприклад, qwen3-vl-4b-instruct) у "
+                "Модель → Підключення."
+            )
         want = max(1, int(self.cfg.vision_frames or 1))
         if want > 1 and not framegrab.available():
             self.log(

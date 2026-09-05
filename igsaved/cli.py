@@ -43,9 +43,9 @@ def rotate_logs(log_dir: Path = LOG_DIR, keep_months: int = LOG_KEEP_MONTHS) -> 
     """
     cutoff = datetime.now() - timedelta(days=31 * keep_months)
     removed = 0
-    for path in log_dir.glob("sync_*.log"):
+    for path in list(log_dir.glob("sync_*.log")) + list(log_dir.glob("gui_*.log")):
         try:
-            stamp = datetime.strptime(path.stem[len("sync_"):], "%Y-%m")
+            stamp = datetime.strptime(path.stem.split("_", 1)[1], "%Y-%m")
         except ValueError:
             continue
         if stamp < cutoff:

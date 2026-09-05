@@ -918,13 +918,24 @@ class MainWindow(PagesMixin, QMainWindow):
         self.cb_vision_model.clear()
         self.cb_vision_model.addItems(models)
         self.cb_vision_model.setCurrentText(current or (models[0] if models else ""))
+        from ..vision import looks_visual
+
+        chosen = self.cb_vision_model.currentText().strip()
         if not models:
             self.lbl_vision.setText("Сервер відповідає, але жодної моделі не завантажено.")
             self.lbl_vision.setProperty("role", "warn")
+        elif chosen and not looks_visual(chosen):
+            visual = [m for m in models if looks_visual(m)]
+            self.lbl_vision.setText(
+                f"«{chosen}» — текстова модель: кадрів вона не побачить, описів не буде. "
+                + (f"Візуальні серед завантажених: {', '.join(visual)}." if visual
+                   else "Завантаж у LM Studio візуальну модель (qwen3-vl-4b-instruct).")
+            )
+            self.lbl_vision.setProperty("role", "err")
         else:
             self.lbl_vision.setText(
-                f"LM Studio на звʼязку · завантажено моделей: {len(models)}. "
-                "Обери візуальну — текстова не побачить картинку."
+                f"LM Studio на звʼязку · завантажено моделей: {len(models)}"
+                + (f" · обрано {chosen}" if chosen else " · буде взята перша візуальна") + "."
             )
             self.lbl_vision.setProperty("role", "ok")
             if not self.ck_vision.isChecked():
@@ -1883,7 +1894,16 @@ class MainWindow(PagesMixin, QMainWindow):
         self.on_start()
 
     def _log(self, message: str) -> None:
-        self.log_view.appendPlainText(f"[{datetime.now():%H:%M:%S}] {message}")
+        line = f"[{datetime.now():%H:%M:%S}] {message}"
+        self.log_view.appendPlainText(line)
+        # І у файл: журнал вікна жив лише у вікні, і після закриття від нього не
+        # лишалось нічого — розбирати «чому не описало» було нізвідки.
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(LOG_DIR / f"gui_{datetime.now():%Y-%m}.log", "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
 
     def _session_log(self, message: str) -> None:
         self.session_log.appendPlainText(message)
