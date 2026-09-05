@@ -20,6 +20,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Повна історія з тегами — інакше нотатки релізу нема з чого скласти.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -43,6 +46,41 @@ jobs:
           version=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('igsaved/__init__.py').read_text(encoding='utf-8')).group(1))")
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
+
+      - name: Write release notes from commit messages
+        # GitHub без pull request'ів генерує лише посилання «Full Changelog».
+        # Нотатки складаємо самі: заголовки комітів від попереднього тегу,
+        # без службових трейлерів.
+        shell: bash
+        run: |
+          current="${GITHUB_REF_NAME}"
+          previous=$(git describe --tags --abbrev=0 "${current}^" 2>/dev/null || true)
+          {
+            echo "## InstRef ${{ steps.version.outputs.value }}"
+            echo
+            if [ -n "$previous" ]; then
+              range="${previous}..${current}"
+              echo "Changes since ${previous}:"
+            else
+              range="${current}"
+              echo "Changes:"
+            fi
+            echo
+            git log "$range" --no-merges --pretty='- %s' \
+              | grep -viE '^- (docs|ci|build|tests?|chore)(\(|:)' || true
+            echo
+            echo "<details><summary>Housekeeping</summary>"
+            echo
+            git log "$range" --no-merges --pretty='- %s' \
+              | grep -iE '^- (docs|ci|build|tests?|chore)(\(|:)' || echo "- —"
+            echo
+            echo "</details>"
+            echo
+            if [ -n "$previous" ]; then
+              echo "Full diff: https://github.com/${GITHUB_REPOSITORY}/compare/${previous}...${current}"
+            fi
+          } > release_notes.md
+          cat release_notes.md
 
       - name: Build the application
         run: pyinstaller InstRef.spec --noconfirm
@@ -77,4 +115,5 @@ jobs:
           files: |
             dist/InstRef-Setup-*.exe
             dist/InstRef-*-portable.zip
-          generate_release_notes: true
+          body_path: release_notes.md
+          generate_release_notes: false

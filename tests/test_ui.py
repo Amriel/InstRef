@@ -247,3 +247,16 @@ def test_about_page_offers_one_click_update(window):
     window._manual_check = True
     window._on_update_checked(None)
     assert "найновіша" in window.lbl_update.text()
+
+
+def test_model_list_is_filled_from_health_check(window):
+    """Список моделей LM Studio приходить сам; текстові позначені й стоять нижче."""
+    window._on_health({"eagle": (True, "Eagle"),
+                       "model": (True, "qwen3-vl-4b-instruct"),
+                       "models": ["qwen3.8-27b", "qwen3-vl-4b-instruct"]})
+    items = [window.cb_vision_model.itemText(i) for i in range(window.cb_vision_model.count())]
+    assert items[0] == "qwen3-vl-4b-instruct"
+    assert items[1].startswith("qwen3.8-27b") and "текстова" in items[1]
+    window.cb_vision_model.setCurrentIndex(1)
+    window._collect_ui_into_config()
+    assert window.cfg.vision_model == "qwen3.8-27b"       # без помітки

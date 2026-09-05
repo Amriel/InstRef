@@ -269,10 +269,16 @@ class HealthWorker(QThread):
             result["eagle"] = (False, str(exc))
         if not self.cfg.vision_enabled:
             result["model"] = (None, "вимкнено")
+            # Список моделей потрібен і тоді: щоб було з чого обирати, коли вмикатимеш.
+            try:
+                result["models"] = list(vision.client_for(self.cfg).list_models())
+            except Exception:  # noqa: BLE001
+                result["models"] = []
         else:
             try:
                 client = vision.client_for(self.cfg)
                 models = client.list_models()
+                result["models"] = list(models)
                 if not models:
                     result["model"] = (False, "модель не завантажена")
                 else:

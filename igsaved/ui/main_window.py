@@ -213,6 +213,8 @@ class MainWindow(PagesMixin, QMainWindow):
         self.btn_save.setVisible(index not in (PAGE_OVERVIEW, PAGE_REVIEW, PAGE_ABOUT))
         if index == PAGE_REVIEW:
             self.review_tab.setFocus()
+        if index == PAGE_MODEL and not getattr(self, "_models_loaded", False):
+            self._check_health()
 
     def _open_session_tab(self) -> None:
         self._go(PAGE_ACCOUNT, 0)
@@ -477,7 +479,9 @@ class MainWindow(PagesMixin, QMainWindow):
         self.btn_update.setText(f"Оновити до {latest.get('version')}")
         self.btn_update.setEnabled(True)
         self.btn_check_update.setEnabled(True)
-        notes = (latest.get("notes") or "").strip()
+        from ..updates import plain_notes
+
+        notes = plain_notes(latest.get("notes") or "")
         self.update_notes.setPlainText(notes or "Опису релізу немає.")
         self.update_notes.setVisible(True)
         self._manual_check = False
@@ -576,7 +580,28 @@ class MainWindow(PagesMixin, QMainWindow):
         self.health_worker.done.connect(self._on_health)
         self.health_worker.start()
 
+    def _fill_models(self, models: list) -> None:
+        """Список моделей LM Studio у випадайку — візуальні першими, текстові з поміткою.
+
+        Раніше список зʼявлявся лише після кнопки «Перевірити», і в поле легко
+        потрапляла текстова модель, набрана руками.
+        """
+        from ..vision import looks_visual
+
+        combo = self.cb_vision_model
+        current = combo.currentText().strip()
+        combo.blockSignals(True)
+        combo.clear()
+        ordered = sorted(models, key=lambda m: (not looks_visual(m), m.lower()))
+        for name in ordered:
+            combo.addItem(name if looks_visual(name) else f"{name}   — текстова", name)
+        combo.setCurrentText(current)
+        combo.blockSignals(False)
+        self._models_loaded = bool(models)
+
     def _on_health(self, result: dict) -> None:
+        if "models" in result:
+            self._fill_models(result.get("models") or [])
         ok, text = result.get("eagle", (False, "?"))
         if self.cfg.eagle_enabled:
             self._set_indicator(self.ind_eagle, ok, "Eagle", text if ok else "не відповідає")
@@ -767,7 +792,11 @@ class MainWindow(PagesMixin, QMainWindow):
         cfg.allow_accounts = _csv(self.ed_allow.text())
         cfg.vision_enabled = self.ck_vision.isChecked()
         cfg.vision_url = self.ed_vision_url.text().strip() or "http://localhost:1234/v1"
-        cfg.vision_model = self.cb_vision_model.currentText().strip()
+        chosen_model = self.cb_vision_model.currentText().strip()
+        index = self.cb_vision_model.findText(chosen_model)
+        if index >= 0 and self.cb_vision_model.itemData(index):
+            chosen_model = str(self.cb_vision_model.itemData(index))
+        cfg.vision_model = chosen_model.split("   — ")[0].strip()
         cfg.vision_min_confidence = self.sp_vision_conf.value()
         cfg.vision_skip_categories = (
             (["meme"] if self.ck_vision_meme.isChecked() else [])
@@ -914,13 +943,13 @@ class MainWindow(PagesMixin, QMainWindow):
             self._restyle(self.lbl_vision)
             return
 
-        current = self.cb_vision_model.currentText().strip()
-        self.cb_vision_model.clear()
-        self.cb_vision_model.addItems(models)
-        self.cb_vision_model.setCurrentText(current or (models[0] if models else ""))
         from ..vision import looks_visual
 
+        self._fill_models(models)
         chosen = self.cb_vision_model.currentText().strip()
+        if not chosen and models:
+            chosen = next((m for m in models if looks_visual(m)), "")
+            self.cb_vision_model.setCurrentText(chosen)
         if not models:
             self.lbl_vision.setText("Сервер відповідає, але жодної моделі не завантажено.")
             self.lbl_vision.setProperty("role", "warn")

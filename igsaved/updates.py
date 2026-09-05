@@ -67,6 +67,17 @@ def installer_asset(latest: dict) -> Optional[dict]:
     return None
 
 
+def plain_notes(markdown: str) -> str:
+    """Нотатки релізу без розмітки: жирного, заголовків, <details>."""
+    text = str(markdown or "")
+    text = re.sub(r"<details>.*?<summary>(.*?)</summary>", r"\1:", text, flags=re.S)
+    text = re.sub(r"</?details>", "", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
+    text = text.replace("**", "").replace("`", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def check(current: str, timeout: int = 6) -> Optional[dict]:
     """Нова версія, якщо є: {'version', 'url', 'name'}; інакше None."""
     latest = fetch_latest(timeout)
