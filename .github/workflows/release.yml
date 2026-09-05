@@ -10,6 +10,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # Windows читає файли як cp1252; у коді українські коментарі.
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 jobs:
   build:
     runs-on: windows-latest
@@ -35,7 +40,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          version=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('igsaved/__init__.py').read_text()).group(1))")
+          version=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('igsaved/__init__.py').read_text(encoding='utf-8')).group(1))")
           echo "value=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
 
