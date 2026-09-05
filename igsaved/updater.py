@@ -99,8 +99,10 @@ def launch_installer_and_relaunch(installer: Path, app_exe: Path) -> None:
     """
     if sys.platform != "win32":
         raise UpdateError("Інсталятор — лише для Windows.")
+    # Пауза через ping, а не timeout: у відокремленого cmd немає консолі, і
+    # timeout там падає з «Input redirection is not supported».
     script = (
-        f'timeout /t 2 /nobreak >nul & '
+        f'ping -n 3 127.0.0.1 >nul & '
         f'"{installer}" /SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /NORESTART & '
         f'start "" "{app_exe}"'
     )

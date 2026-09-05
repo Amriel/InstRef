@@ -4,6 +4,11 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.4.4
+
+- The relaunch helper no longer depends on a console (`timeout` failed in a
+  detached process); the app now really comes back after an update.
+
 ## 2.4.3
 
 - After a one-click update the installed app starts again by itself. The silent
