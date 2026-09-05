@@ -3817,20 +3817,24 @@ def test_text_model_is_recognised_and_not_preferred():
     assert VisionVerdict(tags=["cgi", "autotagged"]).has_text
 
 
-def test_installed_update_relaunches_the_app_after_the_installer(monkeypatch, tmp_path):
-    """Після оновлення застосунок не запускався назад: тихий інсталятор не
-    запускає програму, а сам застосунок уже вийшов. Помічник робить це за них."""
+def test_installed_update_waits_for_the_app_to_exit_then_relaunches(monkeypatch, tmp_path):
+    """Після оновлення застосунок не запускався назад, а інсталятор мовчки
+    скасовувався: він стартував над ще живим .exe. Помічник має чекати PID."""
     import subprocess
 
     from igsaved import updater
 
     monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.tempfile, "gettempdir", lambda: str(tmp_path))
     calls = []
     monkeypatch.setattr(subprocess, "Popen", lambda args, **kw: calls.append((args, kw)))
-    updater.launch_installer_and_relaunch(tmp_path / "InstRef-Setup-9.exe", tmp_path / "InstRef.exe")
-    args, kwargs = calls[0]
-    assert args[:2] == ["cmd", "/c"]
-    script = args[2]
-    assert "InstRef-Setup-9.exe" in script and "/SILENT" in script
-    assert script.index("Setup") < script.index('start "" ')     # спершу інсталятор, потім застосунок
-    assert "InstRef.exe" in script.split('start "" ')[1]
+    script = updater.launch_installer_and_relaunch(
+        tmp_path / "InstRef-Setup-9.exe", tmp_path / "InstRef.exe", pid=4242)
+    args, _ = calls[0]
+    assert args[:2] == ["cmd", "/c"] and Path(args[2]) == script
+    text = script.read_text(encoding="cp1251")
+    assert 'PID eq 4242' in text and "goto wait" in text          # чекає саме процес
+    assert text.index("goto wait") < text.index("InstRef-Setup-9.exe")
+    assert "/SILENT" in text and "/LOG=" in text
+    assert text.index("InstRef-Setup-9.exe") < text.index('start "" ')
+    assert 'start "" "' + str(tmp_path / "InstRef.exe") in text

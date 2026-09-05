@@ -89,28 +89,52 @@ def update_installed(latest: dict, progress: Progress = lambda *a: None) -> str:
     return str(target)
 
 
-def launch_installer_and_relaunch(installer: Path, app_exe: Path) -> None:
-    """Тихий інсталятор, а після нього — знову застосунок.
+def relaunch_script(installer: Path, app_exe: Path, pid: int, log_path: Path) -> str:
+    """Текст батника-помічника.
+
+    Чекає, доки процес застосунку (pid) справді зникне — не «секунду-дві», а
+    скільки треба: інсталятор, що стартує над живим .exe, бачить зайняті файли
+    і з /SUPPRESSMSGBOXES мовчки скасовується. Потім ставить тихо, з логом у
+    %TEMP%, і запускає новий .exe.
+    """
+    return (
+        "@echo off\r\n"
+        ":wait\r\n"
+        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+        "if not errorlevel 1 (\r\n"
+        "  ping -n 2 127.0.0.1 >nul\r\n"
+        "  goto wait\r\n"
+        ")\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        f'"{installer}" /SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /NORESTART '
+        f'/LOG="{log_path}"\r\n'
+        f'start "" "{app_exe}"\r\n'
+        'del "%~f0"\r\n'
+    )
+
+
+def launch_installer_and_relaunch(installer: Path, app_exe: Path,
+                                  pid: Optional[int] = None) -> Path:
+    """Тихий інсталятор, а після нього — знову застосунок. Повертає шлях батника.
 
     На інсталятор тут не покладаємось: у тихому режимі він не запускає програму
     (`skipifsilent`), а «/RESTARTAPPLICATIONS» перезапускає лише те, що сам і
-    закрив — ми ж виходимо самі. Тому окремий невидимий cmd: чекає, доки
-    застосунок вийде, запускає інсталятор синхронно і потім — новий .exe.
+    закрив — ми ж виходимо самі.
     """
     if sys.platform != "win32":
         raise UpdateError("Інсталятор — лише для Windows.")
-    # Пауза через ping, а не timeout: у відокремленого cmd немає консолі, і
-    # timeout там падає з «Input redirection is not supported».
-    script = (
-        f'ping -n 3 127.0.0.1 >nul & '
-        f'"{installer}" /SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /NORESTART & '
-        f'start "" "{app_exe}"'
+    temp = Path(tempfile.gettempdir())
+    script_path = temp / "instref-update.bat"
+    log_path = temp / "InstRef-update.log"
+    script_path.write_text(
+        relaunch_script(installer, app_exe, pid or os.getpid(), log_path), encoding="cp1251"
     )
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
-        subprocess.Popen(["cmd", "/c", script], creationflags=flags, close_fds=True)
+        subprocess.Popen(["cmd", "/c", str(script_path)], creationflags=flags, close_fds=True)
     except OSError as exc:
         raise UpdateError(f"Не вдалось запустити інсталятор: {exc}") from exc
+    return script_path
 
 
 # ------------------------------------------------------------- з вихідників

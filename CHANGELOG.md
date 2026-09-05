@@ -4,10 +4,17 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.4.5
+
+- Updating the installed app now works end to end. The helper waits until the
+  app has actually exited before starting the silent installer (previously the
+  installer found the files in use and quietly gave up), then starts InstRef
+  again. The installer writes a log to `%TEMP%\InstRef-update.log`.
+
 ## 2.4.4
 
-- The relaunch helper no longer depends on a console (`timeout` failed in a
-  detached process); the app now really comes back after an update.
+- Relaunch helper without `timeout` (it fails in a detached process). Not
+  enough on its own — see 2.4.5.
 
 ## 2.4.3
 
