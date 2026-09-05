@@ -1,190 +1,62 @@
-"""Головне вікно застосунку."""
+"""Головне вікно застосунку: бічна панель розділів + сторінки.
+
+Композиція сторінок тут, вміст блоків — у pages.py (PagesMixin), спільні
+дрібні віджети — у widgets.py. Обробники дій лишаються тут, бо тримають стан
+вікна (воркери, конфіг, базу).
+"""
 
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QTime, QTimer
+from PySide6.QtCore import QSize, Qt, QTime, QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-    QSpinBox, QSplitter, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidget,
-    QTableWidgetItem, QTabWidget, QTimeEdit, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
+    QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QStackedWidget, QStyle, QSystemTrayIcon, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__, status
 from ..config import (
-    ALL_POSTS_PK, Config, DEFAULT_TEMPLATE, LIKED_PK, LOG_DIR, SCHED_DAILY, SCHED_HOURLY,
-    SCHED_ONLOGON, SCHED_WEEKLY, SCHEDULE_LABELS, STATE_PATH, STRUCTURE_FLAT,
-    STRUCTURE_PER_COLLECTION, TEMPLATE_TOKENS, WEEKDAYS, app_dir, clear_session,
-    load_session, resource_dir, save_session,
+    ALL_POSTS_PK, Config, DEFAULT_TEMPLATE, FROZEN, LIKED_PK, LOG_DIR, SCHED_DAILY,
+    SCHED_HOURLY, SCHED_ONLOGON, SCHED_WEEKLY, STATE_PATH, STRUCTURE_FLAT, app_dir, clear_session, load_session, resource_dir,
+    save_session,
 )
 from ..downloader import human_size
 from ..eagle import EagleClient, EagleError
 from ..instagram import CollectionInfo
-from ..session import BROWSER_LABELS, MANUAL_HELP, normalize_sessionid, sessionid_from_cookies_txt
+from ..session import BROWSER_LABELS, normalize_sessionid, sessionid_from_cookies_txt
 from ..state import State
 from ..vision import (
     DEFAULT_PROMPT as VISION_PROMPT,
     MAX_FRAMES as VISION_MAX_FRAMES,
-    PLACEHOLDERS as VISION_PLACEHOLDERS,
     SAFE_FRAMES as VISION_SAFE_FRAMES,
 )
+from .pages import DESCRIBE_LABEL, PagesMixin
 from .review_tab import ReviewTab
+from .widgets import _csv, _label, _same_prompt, _scrollable, _stack_page, _subtabs
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
     DupeWorker, HealthWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
-    UpdateWorker, UrlWorker,
+    UpdateWorker, UpgradeWorker, UrlWorker,
 )
 
 EAGLE_DEFAULT_URL = "http://localhost:41595"
-LABEL_WIDTH = 168  # однакова колонка підписів на всіх сторінках налаштувань
 
-DESCRIBE_LABEL = "Описати бібліотеку моделлю"
-
-
-def _label(text: str, role: str = "") -> QLabel:
-    lbl = QLabel(text)
-    if role:
-        lbl.setProperty("role", role)
-    lbl.setWordWrap(True)
-    return lbl
+# Розділи бічної панелі — у цьому порядку. Індекси використовуються в _go().
+PAGE_OVERVIEW, PAGE_SYNC, PAGE_REVIEW, PAGE_MODEL, PAGE_EAGLE, PAGE_ACCOUNT, \
+    PAGE_MAINTENANCE, PAGE_ABOUT = range(8)
+PAGE_TITLES = ["Огляд", "Синхронізація", "Перегляд", "Модель", "Eagle",
+               "Акаунт", "Обслуговування", "Про застосунок"]
 
 
-def _row(layout) -> QWidget:
-    """Прозора обгортка, щоб горизонтальний ряд можна було класти у QFormLayout."""
-    wrapper = QWidget()
-    wrapper.setProperty("role", "row")
-    layout.setContentsMargins(0, 0, 0, 0)
-    wrapper.setLayout(layout)
-    return wrapper
-
-
-def _left(*widgets) -> QHBoxLayout:
-    """Ряд, притиснутий вліво, щоб вузькі поля не розтягувались на всю ширину."""
-    layout = QHBoxLayout()
-    for widget in widgets:
-        layout.addWidget(widget)
-    layout.addStretch(1)
-    return layout
-
-
-def _flabel(text: str) -> QLabel:
-    """Підпис поля фіксованої ширини — щоб колонки не «стрибали» між розділами."""
-    lbl = QLabel(text)
-    lbl.setFixedWidth(LABEL_WIDTH)
-    lbl.setAlignment(Qt.AlignRight | Qt.AlignTop)
-    lbl.setWordWrap(True)
-    lbl.setContentsMargins(0, 7, 0, 0)
-    return lbl
-
-
-HINT_ASSUMED_WIDTH = 330  # свідомо вузько: краще зайвий піксель, ніж обрізаний рядок
-
-
-class _Hint(QLabel):
-    """Пояснення під полем.
-
-    QFormLayout не питає обгорнутий QLabel про heightForWidth, тому текст
-    обрізався знизу. Рахуємо потрібну висоту самі — і перераховуємо щоразу,
-    коли текст або ширина змінюються.
-    """
-
-    def __init__(self, text: str = ""):
-        super().__init__(text)
-        self.setProperty("role", "hint")
-        self.setWordWrap(True)
-        self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.MinimumExpanding)
-        self._recalc()
-
-    def setText(self, text: str) -> None:  # noqa: N802 — Qt API
-        super().setText(text)
-        self._recalc()
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 — Qt API
-        super().resizeEvent(event)
-        self._recalc()
-
-    def _recalc(self) -> None:
-        # Рахувати треба за фактичною шириною: якщо взяти більшу, ніж є,
-        # вийде менше рядків, ніж потрібно — і хвіст тексту обріжеться.
-        width = self.width() if self.width() > 60 else HINT_ASSUMED_WIDTH
-        needed = self.fontMetrics().boundingRect(
-            0, 0, width, 10000, Qt.TextWordWrap, self.text() or " "
-        ).height()
-        self.setMinimumHeight(needed + 6)
-
-
-def _hint(text: str = "", lines: int = 2) -> QLabel:
-    return _Hint(text)
-
-
-def _page(title: str) -> tuple[QWidget, QFormLayout]:
-    """Сторінка розділу з заголовком і готовою формою."""
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(16, 14, 16, 16)
-    layout.setSpacing(10)
-    layout.addWidget(_label(title, "h2"))
-
-    holder = QWidget()
-    form = _form(holder)
-    form.setContentsMargins(0, 4, 0, 0)
-    layout.addWidget(holder)
-    layout.addStretch(1)
-    return page, form
-
-
-def _gap(form: QFormLayout, height: int = 10) -> None:
-    spacer = QWidget()
-    spacer.setFixedHeight(height)
-    form.addRow(spacer)
-
-
-def _scrollable(widget: QWidget) -> QScrollArea:
-    """Сторінка гортається лише тоді, коли реально не влазить."""
-    area = QScrollArea()
-    area.setWidgetResizable(True)
-    area.setFrameShape(QScrollArea.NoFrame)
-    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    area.setWidget(widget)
-    return area
-
-
-def _same_prompt(left: str, right: str) -> bool:
-    """Порівняння інструкцій без оглядки на переноси й зайві пробіли."""
-    return " ".join((left or "").split()) == " ".join((right or "").split())
-
-
-def _csv(text: str) -> List[str]:
-    """Рядок «a, b, c» → список без порожніх і дублікатів."""
-    seen, result = set(), []
-    for chunk in (text or "").replace(";", ",").split(","):
-        value = chunk.strip().lstrip("@#")
-        if value and value.lower() not in seen:
-            seen.add(value.lower())
-            result.append(value)
-    return result
-
-
-def _form(parent: QWidget) -> QFormLayout:
-    form = QFormLayout(parent)
-    form.setSpacing(8)
-    form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    form.setFormAlignment(Qt.AlignTop)
-    form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-    return form
-
-
-class MainWindow(QMainWindow):
+class MainWindow(PagesMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = Config.load()
@@ -206,6 +78,8 @@ class MainWindow(QMainWindow):
         self.url_worker: Optional[UrlWorker] = None
         self.health_worker: Optional[HealthWorker] = None
         self.update_worker: Optional[UpdateWorker] = None
+        self.upgrade_worker: Optional[UpgradeWorker] = None
+        self._manual_check = False
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1020, 720)
@@ -269,100 +143,114 @@ class MainWindow(QMainWindow):
             self.tray.showMessage(title, text, QSystemTrayIcon.Information, 6000)
 
     # ================================================================ побудова
+
     def _build(self) -> None:
         root = QWidget()
-        layout = QVBoxLayout(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        # Бічна панель: усі розділи на одному рівні, кожен — одна тема.
+        self.sidebar = QListWidget()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(196)
+        for title in PAGE_TITLES:
+            item = QListWidgetItem(title)
+            item.setSizeHint(QSize(0, 40))
+            self.sidebar.addItem(item)
+        body.addWidget(self.sidebar)
+
+        self.stack = QStackedWidget()
+        self.review_tab = ReviewTab(self.cfg, self.state, self._log,
+                                    on_change=self._set_review_badge)
+        for builder in (self._page_overview, self._page_sync, lambda: self.review_tab,
+                        self._page_model, self._page_eagle, self._page_account,
+                        self._page_maintenance, self._page_about):
+            self.stack.addWidget(builder())
+        self.sidebar.currentRowChanged.connect(self._on_page_changed)
+        body.addWidget(self.stack, 1)
+        outer.addLayout(body, 1)
+
+        # Нижня смуга: підсумок бібліотеки й одна кнопка збереження на всі сторінки.
+        bottom = QFrame()
+        bottom.setObjectName("bottombar")
+        bar = QHBoxLayout(bottom)
+        bar.setContentsMargins(14, 6, 14, 6)
+        self.lbl_totals = _label("", "muted")
+        self.status_label = _label("", "muted")
+        self.status_label.setWordWrap(False)
+        self.btn_save = QPushButton("Зберегти налаштування")
+        self.btn_save.setProperty("role", "primary")
+        self.btn_save.clicked.connect(self.on_save_settings)
+        bar.addWidget(self.lbl_totals, 1)
+        bar.addWidget(self.status_label)
+        bar.addWidget(self.btn_save)
+        outer.addWidget(bottom)
+
+        self.setCentralWidget(root)
+        self._set_review_badge(self.state.review_count())
+        self.sidebar.setCurrentRow(PAGE_OVERVIEW)
+
+    # ------------------------------------------------------------ навігація
+    def _go(self, page: int, subtab: Optional[int] = None) -> None:
+        self.sidebar.setCurrentRow(page)
+        widget = self.stack.widget(page)
+        tabs = getattr(widget, "subtabs", None)
+        if tabs is not None and subtab is not None:
+            tabs.setCurrentIndex(subtab)
+
+    def _on_page_changed(self, index: int) -> None:
+        """Перехід між розділами зберігає правки: забуте «Зберегти» коштувало
+        не одному налаштуванню."""
+        self.stack.setCurrentIndex(index)
+        if getattr(self, "_ui_loaded", False):
+            self._collect_ui_into_config()
+            self.cfg.save()
+        self.btn_save.setVisible(index not in (PAGE_OVERVIEW, PAGE_REVIEW, PAGE_ABOUT))
+        if index == PAGE_REVIEW:
+            self.review_tab.setFocus()
+
+    def _open_session_tab(self) -> None:
+        self._go(PAGE_ACCOUNT, 0)
+
+    def _open_settings(self, page: int) -> None:
+        """Сумісність зі старими викликами: номер сторінки старих налаштувань."""
+        mapping = {0: (PAGE_SYNC, 1), 1: (PAGE_SYNC, 2), 2: (PAGE_SYNC, 3),
+                   3: (PAGE_MODEL, 0), 4: (PAGE_EAGLE, 0), 5: (PAGE_ACCOUNT, 2),
+                   6: (PAGE_MAINTENANCE, 0)}
+        target, sub = mapping.get(page, (PAGE_SYNC, 0))
+        self._go(target, sub)
+
+    # ------------------------------------------------------------- сторінки
+    def _page_overview(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 12)
         layout.setSpacing(10)
 
-        header = QHBoxLayout()
-        title = _label(APP_NAME, "h1")
-        self.status_label = _label("", "muted")
-        self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.status_label)
-        layout.addLayout(header)
-
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._tab_sync(), "Синхронізація")
-        self.tabs.addTab(self._tab_settings(), "Налаштування")
-        self.review_tab = ReviewTab(self.cfg, self.state, self._log,
-                                    on_change=self._set_review_badge)
-        self.tabs.addTab(self.review_tab, "Ревʼю")
-        # Вкладка рахувала себе ще до того, як опинилась у QTabWidget, тож
-        # виставляємо значок тут — інакше на старті він був би порожній.
-        self._set_review_badge(self.state.review_count())
-        self.session_index = self.tabs.addTab(self._tab_session(), "Сесія")
-        layout.addWidget(self.tabs, 1)
-
-        self.setCentralWidget(root)
-
-    # ------------------------------------------------------------- вкладка 1
-    def _tab_sync(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
-        bar = QHBoxLayout()
-        self.btn_refresh = QPushButton("Оновити підбірки")
-        self.btn_refresh.clicked.connect(self.on_refresh_collections)
-        self.btn_check_all = QPushButton("Позначити всі")
-        self.btn_check_all.clicked.connect(lambda: self._set_all_checks(True))
-        self.btn_uncheck_all = QPushButton("Зняти всі")
-        self.btn_uncheck_all.clicked.connect(lambda: self._set_all_checks(False))
-        bar.addWidget(self.btn_refresh)
-        bar.addWidget(self.btn_check_all)
-        bar.addWidget(self.btn_uncheck_all)
-        bar.addStretch(1)
-        self.btn_urls = QPushButton("За посиланням…")
-        self.btn_urls.setToolTip(
-            "Завантажити конкретні пости за адресами — той самий конвеєр:\n"
-            "завантаження → опис → Eagle, без обходу підбірок."
-        )
-        self.btn_urls.clicked.connect(self.on_download_urls)
-        bar.addWidget(self.btn_urls)
-        self.btn_open_folder = QPushButton("Відкрити папку")
-        self.btn_open_folder.clicked.connect(self.on_open_folder)
-        bar.addWidget(self.btn_open_folder)
-        layout.addLayout(bar)
-
-        self.update_notice = QFrame()
-        self.update_notice.setProperty("role", "notice")
-        notice = QHBoxLayout(self.update_notice)
-        notice.setContentsMargins(12, 8, 10, 8)
-        self.update_text = _label("", "title")
-        notice.addWidget(self.update_text, 1)
-        self.btn_update = QPushButton("Завантажити")
-        self.btn_update.clicked.connect(self._open_update)
-        self.btn_update_close = QPushButton("Пізніше")
-        self.btn_update_close.clicked.connect(lambda: self.update_notice.setVisible(False))
-        notice.addWidget(self.btn_update)
-        notice.addWidget(self.btn_update_close)
-        self.update_notice.setVisible(False)
-        self._update_url = ""
-        layout.addWidget(self.update_notice)
-
-        # Швидкий старт: три індикатори того, без чого конвеєр не працює.
-        self.quick = QFrame()
-        self.quick.setProperty("role", "row")
-        quick = QHBoxLayout(self.quick)
-        quick.setContentsMargins(2, 0, 2, 0)
-        quick.setSpacing(14)
-        self.ind_session = self._indicator("Сесія", self._open_session_tab)
-        self.ind_eagle = self._indicator("Eagle", lambda: self._open_settings(4))
-        self.ind_model = self._indicator("Модель", lambda: self._open_settings(3))
-        for widget in (self.ind_session, self.ind_eagle, self.ind_model):
-            quick.addWidget(widget)
-        quick.addStretch(1)
-        self.btn_health = QPushButton("Перевірити")
+        head = QHBoxLayout()
+        head.addWidget(_label(APP_NAME, "h1"))
+        head.addStretch(1)
+        self.btn_health = QPushButton("Перевірити звʼязок")
         self.btn_health.setToolTip("Ще раз запитати Eagle і LM Studio")
         self.btn_health.clicked.connect(self._check_health)
-        quick.addWidget(self.btn_health)
-        layout.addWidget(self.quick)
+        head.addWidget(self.btn_health)
+        layout.addLayout(head)
 
-        # Банер про невдалий попередній (зокрема фоновий) запуск
+        # Три речі, без яких конвеєр не працює — картками, з дорогою до налаштувань.
+        cards = QHBoxLayout()
+        cards.setSpacing(10)
+        self.ind_session = self._indicator("Сесія", self._open_session_tab)
+        self.ind_eagle = self._indicator("Eagle", lambda: self._go(PAGE_EAGLE, 0))
+        self.ind_model = self._indicator("Модель", lambda: self._go(PAGE_MODEL, 0))
+        for card in (self.ind_session, self.ind_eagle, self.ind_model):
+            cards.addWidget(card, 1)
+        layout.addLayout(cards)
+
         self.banner = QFrame()
         self.banner.setProperty("role", "banner")
         banner_layout = QHBoxLayout(self.banner)
@@ -384,42 +272,38 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(False)
         layout.addWidget(self.banner)
 
-        splitter = QSplitter(Qt.Vertical)
+        self.update_notice = QFrame()
+        self.update_notice.setProperty("role", "notice")
+        notice = QHBoxLayout(self.update_notice)
+        notice.setContentsMargins(12, 8, 10, 8)
+        self.update_text = _label("", "title")
+        notice.addWidget(self.update_text, 1)
+        self.btn_update_go = QPushButton("Оновити")
+        self.btn_update_go.clicked.connect(lambda: self._go(PAGE_ABOUT))
+        self.btn_update_close = QPushButton("Пізніше")
+        self.btn_update_close.clicked.connect(lambda: self.update_notice.setVisible(False))
+        notice.addWidget(self.btn_update_go)
+        notice.addWidget(self.btn_update_close)
+        self.update_notice.setVisible(False)
+        self._update_url = ""
+        self._latest = None
+        layout.addWidget(self.update_notice)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["", "Підбірка", "В Instagram", "Завантажено", "Опис"])
-        self.table.setToolTip(
-            "Перша галочка — синхронізувати підбірку; «Опис» — чи показувати її "
-            "пости моделі заради опису й тегів."
-        )
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        head = self.table.horizontalHeader()
-        head.setSectionResizeMode(0, QHeaderView.Fixed)
-        head.setSectionResizeMode(1, QHeaderView.Stretch)
-        head.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        head.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        head.setSectionResizeMode(4, QHeaderView.Fixed)
-        self.table.setColumnWidth(0, 36)
-        self.table.setColumnWidth(4, 52)
-        self.table.itemChanged.connect(self._on_table_item_changed)
-        splitter.addWidget(self.table)
+        # Стан: останній запуск і черга — те, заради чого відкривають вікно.
+        state_row = QHBoxLayout()
+        self.lbl_last_run = _label("", "muted")
+        state_row.addWidget(self.lbl_last_run, 1)
+        self.btn_goto_review = QPushButton("Перегляд")
+        self.btn_goto_review.clicked.connect(lambda: self._go(PAGE_REVIEW))
+        state_row.addWidget(self.btn_goto_review)
+        layout.addLayout(state_row)
 
-        log_box = QWidget()
-        log_layout = QVBoxLayout(log_box)
-        log_layout.setContentsMargins(0, 6, 0, 0)
-        log_layout.setSpacing(6)
-        log_layout.addWidget(_label("Журнал", "h2"))
+        layout.addWidget(_label("Журнал", "h2"))
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(4000)
-        log_layout.addWidget(self.log_view)
-        splitter.addWidget(log_box)
-        splitter.setSizes([300, 260])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(self.log_view, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -435,28 +319,116 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_start = QPushButton("Синхронізувати")
         self.btn_start.setProperty("role", "primary")
+        self.btn_start.setMinimumHeight(36)
         self.btn_start.clicked.connect(self.on_start)
         controls.addWidget(self.btn_stop)
         controls.addWidget(self.btn_start)
         layout.addLayout(controls)
         return page
 
+    def _page_sync(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Синхронізація", "h1"))
+        collections = self._sec_collections()
+        page.subtabs = _subtabs(
+            ("Що качати", _stack_page("", self._sec_download_what())),
+            ("Обхід", _stack_page("", self._sec_scan())),
+            ("Лайки та фільтр", _stack_page("", self._sec_liked())),
+        )
+        page.subtabs.insertTab(0, collections, "Підбірки")
+        page.subtabs.setCurrentIndex(0)
+        layout.addWidget(page.subtabs, 1)
+        return page
+
+    def _page_model(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Візуальна модель", "h1"))
+        page.subtabs = _subtabs(
+            ("Підключення", _stack_page("", self._sec_vision_connection())),
+            ("Кадри", _stack_page("", self._sec_vision_frames())),
+            ("Рішення", _stack_page("", self._sec_vision_decisions())),
+            ("Інструкція", _stack_page("", self._sec_vision_prompt())),
+            ("Словник", _stack_page("", self._sec_vocab())),
+        )
+        layout.addWidget(page.subtabs, 1)
+        return page
+
+    def _page_eagle(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Eagle", "h1"))
+        page.subtabs = _subtabs(
+            ("Підключення", _stack_page("", self._sec_eagle_connect())),
+            ("Теги й нотатка", _stack_page("", self._sec_eagle_tags())),
+            ("Прибирання й дублікати", _stack_page("", self._sec_eagle_cleanup())),
+            ("Бібліотека", _stack_page("", self._sec_eagle_library())),
+        )
+        layout.addWidget(page.subtabs, 1)
+        return page
+
+    def _page_account(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Акаунт", "h1"))
+        page.subtabs = _subtabs(
+            ("Сесія", _stack_page("", self._sec_session())),
+            ("Захист", _stack_page("", self._sec_protection())),
+            ("Розклад", _stack_page("", self._sec_schedule())),
+        )
+        layout.addWidget(page.subtabs, 1)
+        return page
+
+    def _page_maintenance(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(8)
+        layout.addWidget(_label("Обслуговування", "h1"))
+        page.subtabs = _subtabs(
+            ("Файли й база", _stack_page("", self._sec_files())),
+            ("Мережа", _stack_page("", self._sec_network())),
+        )
+        layout.addWidget(page.subtabs, 1)
+        return page
+
+    def _page_about(self) -> QWidget:
+        return _scrollable(_stack_page("", self._sec_about()))
+
     def _indicator(self, title: str, on_click) -> QWidget:
-        box = QWidget()
-        row = QHBoxLayout(box)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        """Картка стану: крапка, заголовок, деталь і кнопка до налаштувань."""
+        box = QFrame()
+        box.setProperty("role", "status")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        head = QHBoxLayout()
         dot = QLabel("●")
         dot.setProperty("role", "muted")
-        text = QLabel(f"{title}: …")
+        caption = QLabel(title)
+        caption.setProperty("role", "title")
+        head.addWidget(dot)
+        head.addWidget(caption)
+        head.addStretch(1)
+        layout.addLayout(head)
+        text = QLabel("…")
         text.setProperty("role", "muted")
+        text.setWordWrap(True)
+        layout.addWidget(text)
         button = QPushButton("Налаштувати")
         button.setFlat(True)
         button.clicked.connect(on_click)
-        row.addWidget(dot)
-        row.addWidget(text)
-        row.addWidget(button)
-        box.dot, box.text, box.button = dot, text, button  # type: ignore[attr-defined]
+        layout.addWidget(button, alignment=Qt.AlignLeft)
+        box.dot, box.text, box.button, box.title = dot, text, button, title  # type: ignore[attr-defined]
         return box
 
     @staticmethod
@@ -465,7 +437,7 @@ class MainWindow(QMainWindow):
         box.dot.setProperty("role", role)
         box.dot.style().unpolish(box.dot)
         box.dot.style().polish(box.dot)
-        box.text.setText(f"{title}: {detail}")
+        box.text.setText(detail)
         box.text.setToolTip(detail)
         box.button.setVisible(not ok)
 
@@ -489,23 +461,106 @@ class MainWindow(QMainWindow):
         from datetime import timezone
         self.state.set_meta("last_update_check",
                             datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        self._latest = latest or None
         if not latest:
+            if getattr(self, "_manual_check", False):
+                self.lbl_update.setText(f"У тебе найновіша версія — {__version__}.")
+            self._manual_check = False
+            self.btn_check_update.setEnabled(True)
             return
         self._update_url = latest.get("url") or ""
         self.update_text.setText(
             f"Є нова версія {latest.get('version')} (у тебе {__version__}).")
         self.update_notice.setVisible(True)
+        self.lbl_update.setText(
+            f"Доступна версія {latest.get('version')} (у тебе {__version__}).")
+        self.btn_update.setText(f"Оновити до {latest.get('version')}")
+        self.btn_update.setEnabled(True)
+        self.btn_check_update.setEnabled(True)
+        notes = (latest.get("notes") or "").strip()
+        self.update_notes.setPlainText(notes or "Опису релізу немає.")
+        self.update_notes.setVisible(True)
+        self._manual_check = False
         self._log(f"Доступне оновлення InstRef {latest.get('version')}: {self._update_url}")
 
-    def _open_update(self) -> None:
-        import webbrowser
+    def on_check_updates_now(self) -> None:
+        self._manual_check = True
+        self.lbl_update.setText("Питаю GitHub…")
+        self.btn_check_update.setEnabled(False)
+        self.update_worker = UpdateWorker(__version__, self)
+        self.update_worker.done.connect(self._on_update_checked)
+        self.update_worker.start()
 
-        if self._update_url:
-            webbrowser.open(self._update_url)
+    def on_update_now(self) -> None:
+        """Одна кнопка: скачати й поставити. Далі застосунок сам закриється."""
+        latest = getattr(self, "_latest", None)
+        if not latest:
+            return
+        if self.sync_worker and self.sync_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Дочекайся кінця синхронізації.")
+            return
+        what = ("Інсталятор завантажиться і запуститься; застосунок закриється й "
+                "відкриється вже новим." if FROZEN else
+                "Код заміниться на новий, робочі файли (налаштування, база, сесія, "
+                "словник) лишаться, залежності оновляться, застосунок перезапуститься.")
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"Оновити до {latest.get('version')}?\n\n{what}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._collect_ui_into_config()
+        self.cfg.save()
+        self.btn_update.setEnabled(False)
+        self.btn_check_update.setEnabled(False)
+        self.update_progress.setVisible(True)
+        self.update_progress.setRange(0, 0)
+        self._log(f"═══ Оновлення до {latest.get('version')} ═══")
+        self.upgrade_worker = UpgradeWorker(latest, self)
+        self.upgrade_worker.progress.connect(self._on_update_progress)
+        self.upgrade_worker.line.connect(self._log)
+        self.upgrade_worker.done.connect(self._on_update_done)
+        self.upgrade_worker.start()
 
-    def _open_settings(self, page: int) -> None:
-        self.tabs.setCurrentIndex(1)
-        self.nav.setCurrentRow(page)
+    def _on_update_progress(self, message: str, done: int, total: int) -> None:
+        self.lbl_update.setText(message)
+        if total > 0:
+            self.update_progress.setRange(0, total)
+            self.update_progress.setValue(min(done, total))
+        else:
+            self.update_progress.setRange(0, 0)
+
+    def _on_update_done(self, ok: bool, message: str) -> None:
+        self.update_progress.setVisible(False)
+        self.btn_check_update.setEnabled(True)
+        if not ok:
+            self.btn_update.setEnabled(True)
+            self.lbl_update.setText(message)
+            self._log(f"✖ Оновлення не вдалося: {message}")
+            QMessageBox.warning(self, APP_NAME, f"Оновлення не вдалося.\n\n{message}")
+            return
+        self.lbl_update.setText(message)
+        self._log(message)
+        if not FROZEN:
+            from ..updater import restart_from_source
+            try:
+                restart_from_source()
+            except OSError as exc:
+                self._log(f"Не вдалось перезапустити сам: {exc}. Запусти InstRef ще раз.")
+        QTimer.singleShot(800, self._quit_app)
+
+    def _open_url(self, url: str) -> None:
+        webbrowser.open(url)
+
+    def on_open_logs(self) -> None:
+        self._open_path(LOG_DIR)
+
+    def on_open_backups(self) -> None:
+        self._open_path(self.state.backup_dir)
+
+    def on_open_appdir(self) -> None:
+        self._open_path(app_dir())
 
     def _check_health(self) -> None:
         if self.sessionid:
@@ -573,826 +628,6 @@ class MainWindow(QMainWindow):
         self.url_worker.done.connect(self._on_sync_done)
         self.url_worker.start()
 
-    # ------------------------------------------------------------- вкладка 2
-    def _tab_settings(self) -> QWidget:
-        """Налаштування розкладені по розділах: без нескінченної прокрутки
-        і з однаковою шириною колонки підписів на всіх сторінках."""
-        page = QWidget()
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(14, 12, 14, 10)
-        outer.setSpacing(10)
-
-        body = QHBoxLayout()
-        body.setSpacing(12)
-
-        self.nav = QListWidget()
-        self.nav.setObjectName("nav")
-        self.nav.setFixedWidth(176)
-        for name in ("Завантаження", "Сканування", "Пролайкане", "Модель",
-                     "Eagle", "Автозапуск", "Додатково"):
-            self.nav.addItem(name)
-
-        self.pages = QStackedWidget()
-        for builder in (self._page_download, self._page_scan, self._page_liked,
-                        self._page_vision, self._page_eagle, self._page_autostart,
-                        self._page_extra):
-            self.pages.addWidget(_scrollable(builder()))
-        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
-
-        body.addWidget(self.nav)
-        body.addWidget(self.pages, 1)
-        outer.addLayout(body, 1)
-
-        bottom = QHBoxLayout()
-        self.btn_open_logs = QPushButton("Папка логів")
-        self.btn_open_logs.clicked.connect(lambda: self._open_path(LOG_DIR))
-        self.lbl_totals = _label("", "muted")
-        self.btn_save = QPushButton("Зберегти налаштування")
-        self.btn_save.setProperty("role", "primary")
-        self.btn_save.clicked.connect(self.on_save_settings)
-        bottom.addWidget(self.btn_open_logs)
-        bottom.addWidget(self.lbl_totals, 1)
-        bottom.addWidget(self.btn_save)
-        outer.addLayout(bottom)
-
-        self.nav.setCurrentRow(0)
-        return page
-
-    # ------------------------------------------------- розділ «Завантаження»
-    def _page_download(self) -> QWidget:
-        page, form = _page("Куди і що зберігати")
-
-        self.ed_dir = QLineEdit()
-        self.btn_pick_dir = QPushButton("Огляд…")
-        self.btn_pick_dir.setFixedWidth(90)
-        self.btn_pick_dir.clicked.connect(self.on_pick_dir)
-        folder = QHBoxLayout()
-        folder.addWidget(self.ed_dir, 1)
-        folder.addWidget(self.btn_pick_dir)
-        form.addRow(_flabel("Папка"), _row(folder))
-
-        self.cb_structure = QComboBox()
-        self.cb_structure.addItem("Усе в одну папку (рекомендовано з Eagle)", STRUCTURE_FLAT)
-        self.cb_structure.addItem("Підпапка на кожну підбірку", STRUCTURE_PER_COLLECTION)
-        form.addRow(_flabel("Структура"), self.cb_structure)
-
-        self.ck_videos = QCheckBox("Відео / Reels")
-        self.ck_photos = QCheckBox("Фото та каруселі")
-        self.ck_thumbs = QCheckBox("Прев\u02bcю (.jpg)")
-        types = QHBoxLayout()
-        for widget in (self.ck_videos, self.ck_photos, self.ck_thumbs):
-            types.addWidget(widget)
-        types.addStretch(1)
-        form.addRow(_flabel("Качати"), _row(types))
-
-        self.ck_embed = QCheckBox("Вшивати у файл")
-        self.ck_embed.setToolTip(
-            "Опис, автор, дата, посилання й хештеги записуються всередину самого\n"
-            "mp4 чи jpg. Видно в плеєрах, у Eagle і у властивостях файлу Windows."
-        )
-        self.ck_meta = QCheckBox("Ще й окремим .json")
-        self.ck_meta.setToolTip("Додатковий файл поруч — з повними даними поста.")
-        meta_row = QHBoxLayout()
-        meta_row.addWidget(self.ck_embed)
-        meta_row.addWidget(self.ck_meta)
-        meta_row.addStretch(1)
-        form.addRow(_flabel("Опис і автор"), _row(meta_row))
-
-        _gap(form)
-
-        self.ed_template = QLineEdit()
-        self.ed_template.setPlaceholderText(DEFAULT_TEMPLATE)
-        self.ed_template.setToolTip(
-            "Доступні токени:\n" + "\n".join(f"{k} — {v}" for k, v in TEMPLATE_TOKENS.items())
-        )
-        form.addRow(_flabel("Шаблон імені"), self.ed_template)
-        form.addRow(_flabel(""), _hint(" ".join(TEMPLATE_TOKENS)))
-
-        self.sp_maxsize = QSpinBox()
-        self.sp_maxsize.setRange(0, 20000)
-        self.sp_maxsize.setSuffix(" МБ")
-        self.sp_maxsize.setSpecialValueText("без обмеження")
-        self.sp_maxsize.setFixedWidth(185)
-        form.addRow(_flabel("Пропускати більші за"), _row(_left(self.sp_maxsize)))
-        return page
-
-    # --------------------------------------------------- розділ «Сканування»
-    def _page_scan(self) -> QWidget:
-        page, form = _page("Як обходити збережене")
-
-        self.ck_incremental = QCheckBox("Лише нове (пропускати вже завантажене)")
-        form.addRow(_flabel(""), self.ck_incremental)
-
-        self.sp_stop_known = QSpinBox()
-        self.sp_stop_known.setRange(0, 500)
-        self.sp_stop_known.setSuffix(" постів")
-        self.sp_stop_known.setFixedWidth(185)
-        self.sp_stop_known.setToolTip(
-            "Скільки вже відомих постів поспіль зустріти, щоб зупинити обхід підбірки.\n"
-            "0 — завжди проходити підбірку до кінця."
-        )
-        form.addRow(_flabel("Стоп після"), _row(_left(self.sp_stop_known)))
-
-        self.sp_scan_limit = QSpinBox()
-        self.sp_scan_limit.setRange(0, 100000)
-        self.sp_scan_limit.setSpecialValueText("без обмеження")
-        self.sp_scan_limit.setSuffix(" постів")
-        self.sp_scan_limit.setFixedWidth(185)
-        self.sp_scan_limit.setToolTip(
-            "Скільки найсвіжіших постів переглядати в збережених і підбірках.\n"
-            "У пролайканого свій окремий ліміт."
-        )
-        form.addRow(_flabel("Дивитись останніх"), _row(_left(self.sp_scan_limit)))
-        form.addRow(_flabel(""), _hint(
-            "Обмежує обхід збережених і підбірок найсвіжішими постами. "
-            "У пролайканого свій ліміт — у розділі «Пролайкане»."))
-
-        self.sp_limit = QSpinBox()
-        self.sp_limit.setRange(0, 100000)
-        self.sp_limit.setSpecialValueText("без ліміту")
-        self.sp_limit.setFixedWidth(185)
-        form.addRow(_flabel("Максимум за запуск"), _row(_left(self.sp_limit)))
-
-        _gap(form)
-
-        self.sp_delay_min = QDoubleSpinBox()
-        self.sp_delay_min.setRange(0.5, 60.0)
-        self.sp_delay_min.setSingleStep(0.5)
-        self.sp_delay_min.setSuffix(" с")
-        self.sp_delay_min.setFixedWidth(112)
-        self.sp_delay_max = QDoubleSpinBox()
-        self.sp_delay_max.setRange(0.5, 120.0)
-        self.sp_delay_max.setSingleStep(0.5)
-        self.sp_delay_max.setSuffix(" с")
-        self.sp_delay_max.setFixedWidth(112)
-        delays = QHBoxLayout()
-        delays.addWidget(QLabel("від"))
-        delays.addWidget(self.sp_delay_min)
-        delays.addWidget(QLabel("до"))
-        delays.addWidget(self.sp_delay_max)
-        delays.addStretch(1)
-        form.addRow(_flabel("Пауза між сторінками"), _row(delays))
-        form.addRow(_flabel(""), _hint(
-            "Головний захист акаунта. Instagram позначає як автоматизацію не обсяг, "
-            "а темп: рівні короткі інтервали виглядають як скрипт, бо людина так "
-            "не гортає. Знижувати без потреби не варто."))
-
-        self.sp_cooldown = QDoubleSpinBox()
-        self.sp_cooldown.setRange(0.0, 168.0)
-        self.sp_cooldown.setSingleStep(1.0)
-        self.sp_cooldown.setDecimals(1)
-        self.sp_cooldown.setSuffix(" год")
-        self.sp_cooldown.setSpecialValueText("без обмеження")
-        self.sp_cooldown.setFixedWidth(150)
-        self.sp_cooldown.setToolTip(
-            "Скільки має минути від попереднього проходу, щоб дозволити наступний.\n"
-            "Запуск за розкладом просто пропускається; ручний — питає підтвердження."
-        )
-        form.addRow(_flabel("Мінімум між проходами"), _row(_left(self.sp_cooldown)))
-        form.addRow(_flabel(""), _hint(
-            "Кожен прохід — це вхід і десятки запитів. Кілька проходів поспіль із "
-            "різницею у хвилини — найпомітніший слід автоматизації, і саме за нього "
-            "приходить попередження від Instagram."))
-
-        self.sp_rate_cooldown = QDoubleSpinBox()
-        self.sp_rate_cooldown.setRange(0.0, 168.0)
-        self.sp_rate_cooldown.setSingleStep(1.0)
-        self.sp_rate_cooldown.setDecimals(0)
-        self.sp_rate_cooldown.setSuffix(" год")
-        self.sp_rate_cooldown.setSpecialValueText("не зупинятись")
-        self.sp_rate_cooldown.setFixedWidth(150)
-        form.addRow(_flabel("Після «зачекай» від Instagram"), _row(_left(self.sp_rate_cooldown)))
-        form.addRow(_flabel(""), _hint(
-            "Відповідь «Please wait a few minutes» або 429 зупиняє весь прохід, і "
-            "стільки годин застосунок не повертається — навіть за ручним запуском."))
-
-        self.sp_attempts = QSpinBox()
-        self.sp_attempts.setRange(0, 20)
-        self.sp_attempts.setSpecialValueText("без межі")
-        self.sp_attempts.setSuffix(" спроб")
-        self.sp_attempts.setFixedWidth(150)
-        form.addRow(_flabel("Спроб на один пост"), _row(_left(self.sp_attempts)))
-        form.addRow(_flabel(""), _hint(
-            "Видалений автором чи битий пост інакше повторювався б кожен прохід. "
-            "Після цієї кількості невдач він відкладається; список — у «Додатково»."))
-        return page
-
-    # -------------------------------------------------- розділ «Пролайкане»
-    def _page_liked(self) -> QWidget:
-        page, form = _page("Пролайкане та фільтр мемів")
-
-        self.ck_sync_liked = QCheckBox("Синхронізувати пролайкане")
-        form.addRow(_flabel(""), self.ck_sync_liked)
-        form.addRow(_flabel(""), _hint(
-            "Зʼявиться окремою підбіркою у списку на вкладці «Синхронізація», "
-            "в Eagle — своєю папкою."))
-
-        self.sp_liked_limit = QSpinBox()
-        self.sp_liked_limit.setRange(0, 100000)
-        self.sp_liked_limit.setSpecialValueText("без обмеження")
-        self.sp_liked_limit.setSuffix(" постів")
-        self.sp_liked_limit.setFixedWidth(185)
-        self.sp_liked_limit.setToolTip(
-            "Скільки найсвіжіших пролайканих переглядати за запуск.\n"
-            "Рахуються саме переглянуті пости, а не завантажені."
-        )
-        form.addRow(_flabel("Дивитись останніх"), _row(_left(self.sp_liked_limit)))
-        form.addRow(_flabel(""), _hint(
-            "Стрічка лайків довга, а відсіяні меми не зменшують ліміт завантажень — "
-            "без цього обмеження обхід тягнувся б через усю історію."))
-
-        _gap(form)
-
-        self.ck_classify = QCheckBox("Відсівати меми")
-        self.ck_classify.setToolTip(
-            "Працює тільки для пролайканого. Збережене качається як є."
-        )
-        form.addRow(_flabel(""), self.ck_classify)
-        form.addRow(_flabel(""), _hint(
-            "Оцінка за хештегами, іменем акаунта, тривалістю та позначкою реклами. "
-            "Метод приблизний: явні випадки визначає добре, межові — ні, тому вони "
-            "їдуть у ревʼю, а не видаляються."))
-
-        self.cb_uncertain = QComboBox()
-        self.cb_uncertain.addItem("Відкласти на ревʼю", "review")
-        self.cb_uncertain.addItem("Качати", "download")
-        self.cb_uncertain.addItem("Пропускати", "skip")
-        self.cb_uncertain.setFixedWidth(240)
-        form.addRow(_flabel("Сумнівні пости"), _row(_left(self.cb_uncertain)))
-
-        self.sp_meme_seconds = QDoubleSpinBox()
-        self.sp_meme_seconds.setRange(0.0, 120.0)
-        self.sp_meme_seconds.setSingleStep(1.0)
-        self.sp_meme_seconds.setSuffix(" с")
-        self.sp_meme_seconds.setSpecialValueText("не зважати")
-        self.sp_meme_seconds.setFixedWidth(150)
-        self.sp_meme_seconds.setToolTip(
-            "Коротке відео без арт-ознак додає бал на користь мема. 0 — вимкнено."
-        )
-        form.addRow(_flabel("Короткі відео до"), _row(_left(self.sp_meme_seconds)))
-
-        _gap(form)
-
-        self.ed_block = QLineEdit()
-        self.ed_block.setPlaceholderText("memepage, 9gag — через кому")
-        form.addRow(_flabel("Ніколи не качати"), self.ed_block)
-
-        self.ed_allow = QLineEdit()
-        self.ed_allow.setPlaceholderText("studioalt, formnorm — через кому")
-        form.addRow(_flabel("Завжди качати"), self.ed_allow)
-        form.addRow(_flabel(""), _hint(
-            "Списки акаунтів мають пріоритет над усіма правилами й поповнюються "
-            "кнопками у вкладці «Ревʼю» — саме вони з часом дають точність."))
-
-        _gap(form)
-
-        self.ed_meme_tags = QLineEdit()
-        self.ed_meme_tags.setPlaceholderText("додаткові хештеги мемів, через кому")
-        form.addRow(_flabel("Мем-хештеги"), self.ed_meme_tags)
-
-        self.ed_art_tags = QLineEdit()
-        self.ed_art_tags.setPlaceholderText("додаткові хештеги арту, через кому")
-        form.addRow(_flabel("Арт-хештеги"), self.ed_art_tags)
-        form.addRow(_flabel(""), _hint(
-            "Візуальна модель, яка дивиться сумнівні пости, — у розділі «Модель»."))
-        return page
-
-    # ------------------------------------------------------ розділ «Модель»
-    def _page_vision(self) -> QWidget:
-        page, form = _page("Візуальна модель (LM Studio)")
-
-        self.ck_vision = QCheckBox("Показувати сумнівні пости моделі")
-        self.ck_vision.setToolTip(
-            "Модель дивиться кадри поста й каже: мем / арт / реклама / гра / інше,\n"
-            "а заразом пише опис і теги. Викликається лише для сумнівних постів —\n"
-            "явне вирішують правила, швидко й безкоштовно."
-        )
-        form.addRow(_flabel(""), self.ck_vision)
-        form.addRow(_flabel(""), _hint(
-            "У LM Studio має бути завантажена візуальна модель і увімкнений сервер "
-            "(вкладка Developer → Start Server). Адресу можна вставляти як є — "
-            "/v1 допишеться сам. Якщо сервер не відповідає, застосунок мовчки "
-            "працює за правилами."))
-
-        self.ed_vision_url = QLineEdit()
-        self.ed_vision_url.setPlaceholderText("http://localhost:1234")
-        form.addRow(_flabel("Адреса LM Studio"), self.ed_vision_url)
-
-        self.cb_vision_model = QComboBox()
-        self.cb_vision_model.setEditable(True)
-        self.cb_vision_model.lineEdit().setPlaceholderText(
-            "порожньо — перша завантажена модель")
-        self.btn_vision_test = QPushButton("Перевірити")
-        self.btn_vision_test.clicked.connect(self.on_test_vision)
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.cb_vision_model, 1)
-        model_row.addWidget(self.btn_vision_test)
-        form.addRow(_flabel("Модель"), _row(model_row))
-        self.lbl_vision = _hint("")
-        form.addRow(_flabel(""), self.lbl_vision)
-
-        _gap(form)
-
-        self.sp_vision_frames = QSpinBox()
-        self.sp_vision_frames.setRange(1, VISION_MAX_FRAMES)
-        self.sp_vision_frames.setSuffix(" кадр(ів)")
-        self.sp_vision_frames.setFixedWidth(185)
-        self.sp_vision_frames.setToolTip(
-            "Скільки кадрів дістати з ролика й показати моделі одним запитом.\n"
-            "1 — тільки обкладинка, як було раніше."
-        )
-        self.sp_vision_frames.valueChanged.connect(self._update_frames_note)
-        form.addRow(_flabel("Кадрів на відео"), _row(_left(self.sp_vision_frames)))
-        self.lbl_frames = _hint("")
-        form.addRow(_flabel(""), self.lbl_frames)
-        form.addRow(_flabel(""), _hint(
-            "Скільки кадрів з одного ролика бачить модель за раз. Беруться "
-            "рівномірно по всій тривалості, краї підрізаються. Обкладинка reels — "
-            "часто чорний кадр або титр, тому один кадр давав найбільше помилок. "
-            "Каруселі модель бачить по слайдах."))
-
-        self.sp_sec_per_frame = QDoubleSpinBox()
-        self.sp_sec_per_frame.setRange(0.0, 60.0)
-        self.sp_sec_per_frame.setDecimals(0)
-        self.sp_sec_per_frame.setSuffix(" с на кадр")
-        self.sp_sec_per_frame.setSpecialValueText("завжди стільки, як вище")
-        self.sp_sec_per_frame.setFixedWidth(185)
-        form.addRow(_flabel("Кадрів від тривалості"), _row(_left(self.sp_sec_per_frame)))
-        form.addRow(_flabel(""), _hint(
-            "Приблизно один кадр на стільки секунд ролика — але не менше, ніж "
-            "вище, і не більше стелі. Десятисекундний reel і трихвилинний "
-            "туторіал не заслуговують однакової кількості кадрів."))
-
-        self.ck_by_scene = QCheckBox("Брати кадри за зміною сцени, минаючи чорні")
-        self.ck_by_scene.setToolTip(
-            "Замість рівних кроків — середина кожної монтажної сцени.\n"
-            "У ролику з жорстким монтажем рівний крок влучає в переходи."
-        )
-        form.addRow(_flabel(""), self.ck_by_scene)
-
-        self.sp_backlog = QSpinBox()
-        self.sp_backlog.setRange(0, 500)
-        self.sp_backlog.setSpecialValueText("вимкнено")
-        self.sp_backlog.setSuffix(" елементів")
-        self.sp_backlog.setFixedWidth(185)
-        form.addRow(_flabel("Дописувати після проходу"), _row(_left(self.sp_backlog)))
-        form.addRow(_flabel(""), _hint(
-            "Після кожної синхронізації описати ще стільки елементів бібліотеки "
-            "Eagle, яким опису бракує. Десяток за прохід непомітний, а за місяць "
-            "планових проходів покриває стару бібліотеку."))
-
-        self.ck_transcribe = QCheckBox("Транскрибувати голос за кадром (faster-whisper)")
-        self.ck_transcribe.setToolTip(
-            "Туторіали пояснюють техніку словами — кадри цього не передають.\n"
-            "Потрібен пакет faster-whisper: pip install faster-whisper."
-        )
-        self.ed_whisper = QLineEdit()
-        self.ed_whisper.setPlaceholderText("small")
-        self.ed_whisper.setFixedWidth(120)
-        self.ed_whisper.setToolTip("Розмір моделі Whisper: tiny / base / small / medium")
-        transcribe_row = QHBoxLayout()
-        transcribe_row.addWidget(self.ck_transcribe)
-        transcribe_row.addWidget(self.ed_whisper)
-        transcribe_row.addStretch(1)
-        form.addRow(_flabel(""), _row(transcribe_row))
-        form.addRow(_flabel(""), _hint(
-            "Текст мовлення йде в інструкцію моделі як контекст і в нотатку Eagle. "
-            "Повільно (ЦП), тому вмикай для підбірок із туторіалами, а не для всього."))
-
-        self.ck_vision_describe = QCheckBox("Писати опис і теги для кожного нового поста")
-        self.ck_vision_describe.setToolTip(
-            "Не лише для сумнівних: модель подивиться кожне нове завантаження."
-        )
-        form.addRow(_flabel(""), self.ck_vision_describe)
-        form.addRow(_flabel(""), _hint(
-            "Збережене модель не судить — тільки описує, і воно одразу йде в Eagle. "
-            "Опис і теги вшиваються у сам файл та в нотатку Eagle. "
-            "Помітно повільніше: кожен пост — окремий запит до моделі."))
-
-        _gap(form)
-
-        self.ck_vision_meme = QCheckBox("меми")
-        self.ck_vision_game = QCheckBox("ігрові")
-        skip_row = QHBoxLayout()
-        skip_row.addWidget(self.ck_vision_meme)
-        skip_row.addWidget(self.ck_vision_game)
-        skip_row.addStretch(1)
-        form.addRow(_flabel("Модель відсіює"), _row(skip_row))
-        form.addRow(_flabel(""), _hint(
-            "Арт і рекламу модель пропускає на завантаження, «інше» лишає тобі в ревʼю."))
-
-        self.sp_vision_conf = QDoubleSpinBox()
-        self.sp_vision_conf.setRange(0.0, 1.0)
-        self.sp_vision_conf.setSingleStep(0.05)
-        self.sp_vision_conf.setDecimals(2)
-        self.sp_vision_conf.setFixedWidth(120)
-        self.sp_vision_conf.setToolTip(
-            "Нижче цієї впевненості рішення моделі не приймається — пост іде в ревʼю."
-        )
-        form.addRow(_flabel("Мінімальна впевненість"), _row(_left(self.sp_vision_conf)))
-
-        self.ck_model_glance = QCheckBox("Показувати рішення моделі окремою вкладкою")
-        self.ck_model_glance.setToolTip(
-            "Модель вирішила — але в Eagle пост іде тільки після твого погляду."
-        )
-        form.addRow(_flabel(""), self.ck_model_glance)
-        form.addRow(_flabel(""), _hint(
-            "Схвалене моделлю лягає в основну теку й чекає підтвердження; "
-            "відсіяне лежить у теці ревʼю, доки не погодишся його видалити. "
-            "Кнопка «Погодитись з моделлю» розбирає всю чергу одним кліком. "
-            "Без галочки модель діє мовчки: качає й видаляє одразу."))
-
-        self.sp_vision_timeout = QSpinBox()
-        self.sp_vision_timeout.setRange(10, 900)
-        self.sp_vision_timeout.setSuffix(" с")
-        self.sp_vision_timeout.setFixedWidth(120)
-        self.sp_vision_timeout.setToolTip(
-            "Кілька кадрів плюс опис — це довше за одну обкладинку.\n"
-            "Якщо в журналі часто «модель не встигла відповісти», збільш."
-        )
-        form.addRow(_flabel("Чекати відповідь до"), _row(_left(self.sp_vision_timeout)))
-
-        _gap(form)
-
-        self.ck_taxonomy = QCheckBox("Брати теги лише зі словника")
-        self.ck_taxonomy.setToolTip(
-            "Усе, чого немає у словнику, відкидається кодом — не проханням до моделі."
-        )
-        form.addRow(_flabel(""), self.ck_taxonomy)
-        form.addRow(_flabel(""), _hint(
-            "Без словника кожен запуск вигадує свої слова: 3d-render, 3drender, "
-            "render і 3d — чотири різні теги для Eagle, і жоден не знайде решту. "
-            "Списки лежать у taxonomy.json — їх можна правити руками."))
-
-        self.btn_taxonomy = QPushButton("Пропозиції до словника")
-        self.btn_taxonomy.setToolTip(
-            "Теги, які модель пропонувала часто, а словник не прийняв.\n"
-            "Звідти ж відкривається сам taxonomy.json."
-        )
-        self.btn_taxonomy.clicked.connect(self.on_tag_suggestions)
-        self.sp_suggest_after = QSpinBox()
-        self.sp_suggest_after.setRange(1, 100)
-        self.sp_suggest_after.setSuffix(" разів")
-        self.sp_suggest_after.setFixedWidth(120)
-        self.sp_suggest_after.setToolTip(
-            "Скільки разів модель має попроситись зі своїм тегом,\n"
-            "щоб застосунок запропонував додати його у словник."
-        )
-        vocab = QHBoxLayout()
-        vocab.addWidget(self.btn_taxonomy)
-        vocab.addWidget(QLabel("після"))
-        vocab.addWidget(self.sp_suggest_after)
-        vocab.addStretch(1)
-        form.addRow(_flabel("Словник росте"), _row(vocab))
-
-        _gap(form)
-
-        prompt_head = QHBoxLayout()
-        prompt_head.addWidget(QLabel("Що саме модель має зробити з кадрами"))
-        prompt_head.addStretch(1)
-        self.btn_prompt_reset = QPushButton("Повернути типову")
-        self.btn_prompt_reset.setFixedWidth(160)
-        self.btn_prompt_reset.clicked.connect(self.on_reset_prompt)
-        prompt_head.addWidget(self.btn_prompt_reset)
-        form.addRow(_flabel("Інструкція"), _row(prompt_head))
-
-        self.ed_vision_prompt = QPlainTextEdit()
-        self.ed_vision_prompt.setMinimumHeight(230)
-        self.ed_vision_prompt.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        form.addRow(_flabel(""), self.ed_vision_prompt)
-        form.addRow(_flabel(""), _hint(
-            "Відповідь має лишатись JSON із полями category, confidence, description "
-            "і tags — інакше застосунок її не зрозуміє. "
-            + " ".join(f"{token} — {what}." for token, what in VISION_PLACEHOLDERS.items())
-            + " Поки інструкцію не змінено, вона оновлюється разом із застосунком."))
-        return page
-
-    # -------------------------------------------------------- розділ «Eagle»
-    def _page_eagle(self) -> QWidget:
-        page, form = _page("Імпорт у бібліотеку Eagle")
-
-        self.ck_eagle = QCheckBox("Імпортувати завантажене в Eagle")
-        form.addRow(_flabel(""), self.ck_eagle)
-
-        self.ed_eagle_url = QLineEdit()
-        self.ed_eagle_url.setPlaceholderText("http://localhost:41595")
-        form.addRow(_flabel("API"), self.ed_eagle_url)
-        form.addRow(_flabel(""), _hint(
-            "Eagle слухає порт 41595, поки програма відкрита. Інший порт — не запрацює."))
-
-        self.ed_eagle_token = QLineEdit()
-        self.ed_eagle_token.setPlaceholderText("лишити порожнім, якщо Eagle не просить")
-        self.ed_eagle_token.setToolTip(
-            "Новіші версії Eagle можуть вимагати токен:\n"
-            "Preferences → Developer (Розробник) → API token."
-        )
-        form.addRow(_flabel("Токен"), self.ed_eagle_token)
-
-        self.ed_eagle_root = QLineEdit()
-        form.addRow(_flabel("Коренева папка"), self.ed_eagle_root)
-
-        self.ck_eagle_once = QCheckBox("Один пост — один елемент у бібліотеці")
-        self.ck_eagle_once.setToolTip(
-            "Пост часто лежить і в збережених, і в лайках, і в підбірці.\n"
-            "Eagle на кожен імпорт КОПІЮЄ файл, тож без цієї галочки\n"
-            "той самий ролик з'являється в бібліотеці двічі-тричі."
-        )
-        form.addRow(_flabel(""), self.ck_eagle_once)
-
-        self.ck_eagle_cleanup = QCheckBox("Видаляти локальні копії після імпорту")
-        self.ck_eagle_cleanup.setToolTip(
-            "Eagle зберігає власну копію кожного файлу — папка завантажень\n"
-            "стає лише перевалкою. Видаляється тільки підтверджене: те, що\n"
-            "реально видно в бібліотеці, а не просто відправлене."
-        )
-        form.addRow(_flabel(""), self.ck_eagle_cleanup)
-        form.addRow(_flabel(""), _hint(
-            "Памʼять зберігається: прибраний пост ніколи не качається вдруге. "
-            "Щойно відправлене чекає до наступного проходу — копіювання на боці "
-            "Eagle асинхронне, і поспішати з видаленням не можна. Черга перегляду "
-            "не чіпається ніколи."))
-
-        self.cb_dupe = QComboBox()
-        for key, label in (("review", "показати в перегляді"),
-                           ("import", "імпортувати як є"),
-                           ("skip", "не брати"),
-                           ("off", "не перевіряти")):
-            self.cb_dupe.addItem(label, key)
-        self.cb_dupe.setFixedWidth(200)
-        self.sp_dupe_dist = QSpinBox()
-        self.sp_dupe_dist.setRange(0, 20)
-        self.sp_dupe_dist.setFixedWidth(70)
-        dupe_row = QHBoxLayout()
-        dupe_row.addWidget(self.cb_dupe)
-        dupe_row.addWidget(QLabel("поріг"))
-        dupe_row.addWidget(self.sp_dupe_dist)
-        dupe_row.addStretch(1)
-        form.addRow(_flabel("Схоже на наявне"), _row(dupe_row))
-        form.addRow(_flabel(""), _hint(
-            "Репост того самого ролика в іншому акаунті — інший пост і інший файл, "
-            "але ті самі кадри. Відбиток кадрів це ловить; поріг — скільки бітів "
-            "із 64 можуть відрізнятись (8 — упевнений збіг, 12 — і перекодоване "
-            "з водяним знаком)."))
-
-        self.ck_eagle_per_col = QCheckBox("Підпапка на кожну підбірку")
-        form.addRow(_flabel(""), self.ck_eagle_per_col)
-
-        _gap(form)
-
-        self.ck_eagle_tags = QCheckBox("Хештеги з підпису")
-        self.ck_eagle_tag_author = QCheckBox("Ім\u02bcя автора (@username)")
-        self.ck_eagle_tag_col = QCheckBox("Назва підбірки")
-        tags_col = QVBoxLayout()
-        tags_col.setSpacing(4)
-        for widget in (self.ck_eagle_tags, self.ck_eagle_tag_author, self.ck_eagle_tag_col):
-            tags_col.addWidget(widget)
-        form.addRow(_flabel("Додавати як теги"), _row(tags_col))
-
-        self.ed_eagle_tags = QLineEdit()
-        self.ed_eagle_tags.setPlaceholderText("instagram, reference — через кому")
-        form.addRow(_flabel("Постійні теги"), self.ed_eagle_tags)
-
-        _gap(form)
-
-        self.btn_eagle_test = QPushButton("Перевірити зв\u02bcязок")
-        self.btn_eagle_test.clicked.connect(self.on_test_eagle)
-        self.lbl_eagle = _hint("")
-        check = QHBoxLayout()
-        check.addWidget(self.btn_eagle_test)
-        check.addWidget(self.lbl_eagle, 1)
-        form.addRow(_flabel(""), _row(check))
-        return page
-
-    # --------------------------------------------------- розділ «Автозапуск»
-    def _page_autostart(self) -> QWidget:
-        page, form = _page("Запуск за розкладом і разом із Windows")
-
-        self.ck_schedule = QCheckBox("Синхронізувати за розкладом")
-        self.ck_schedule.toggled.connect(self._update_schedule_widgets)
-        form.addRow(_flabel(""), self.ck_schedule)
-
-        self.cb_sched_mode = QComboBox()
-        for key in (SCHED_DAILY, SCHED_HOURLY, SCHED_WEEKLY, SCHED_ONLOGON):
-            self.cb_sched_mode.addItem(SCHEDULE_LABELS[key], key)
-        self.cb_sched_mode.setFixedWidth(190)
-        self.cb_sched_mode.currentIndexChanged.connect(self._update_schedule_widgets)
-
-        self.sp_sched_hours = QSpinBox()
-        self.sp_sched_hours.setRange(1, 23)
-        self.sp_sched_hours.setSuffix(" год")
-        self.sp_sched_hours.setFixedWidth(108)
-
-        self.cb_weekday = QComboBox()
-        for key, label in WEEKDAYS:
-            self.cb_weekday.addItem(label, key)
-        self.cb_weekday.setFixedWidth(130)
-
-        self.ed_time = QTimeEdit()
-        self.ed_time.setDisplayFormat("HH:mm")
-        self.ed_time.setFixedWidth(100)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(self.cb_sched_mode)
-        mode_row.addWidget(self.sp_sched_hours)
-        mode_row.addWidget(self.cb_weekday)
-        mode_row.addWidget(QLabel("о"))
-        mode_row.addWidget(self.ed_time)
-        mode_row.addStretch(1)
-        form.addRow(_flabel("Коли"), _row(mode_row))
-
-        self.btn_sched_apply = QPushButton("Застосувати розклад")
-        self.btn_sched_apply.clicked.connect(self.on_apply_schedule)
-        self.btn_sched_run = QPushButton("Запустити зараз")
-        self.btn_sched_run.setToolTip("Виконати задачу планувальника негайно, у фоні")
-        self.btn_sched_run.clicked.connect(self.on_run_task_now)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.btn_sched_apply)
-        buttons.addWidget(self.btn_sched_run)
-        buttons.addStretch(1)
-        form.addRow(_flabel(""), _row(buttons))
-
-        self.lbl_sched = _hint("")
-        form.addRow(_flabel(""), self.lbl_sched)
-
-        self.sp_jitter = QSpinBox()
-        self.sp_jitter.setRange(0, 120)
-        self.sp_jitter.setSpecialValueText("без зсуву")
-        self.sp_jitter.setSuffix(" хв")
-        self.sp_jitter.setFixedWidth(130)
-        form.addRow(_flabel("Випадковий зсув"), _row(_left(self.sp_jitter)))
-        form.addRow(_flabel(""), _hint(
-            "Плановий прохід починається не рівно за розкладом, а у випадковий "
-            "момент у цьому вікні. Рівно о 09:00:00 щодня — підпис скрипта."))
-
-        _gap(form)
-
-        self.ck_run_at_login = QCheckBox("Запускати застосунок разом із Windows")
-        self.ck_start_min = QCheckBox("Стартувати згорнутим у трей")
-        self.ck_sync_launch = QCheckBox("Синхронізувати одразу після запуску")
-        self.ck_tray = QCheckBox("Закриття вікна згортає в трей")
-        self.ck_notify = QCheckBox("Сповіщення після завершення")
-        self.ck_updates = QCheckBox("Перевіряти нові версії на GitHub раз на добу")
-        behaviour = QVBoxLayout()
-        behaviour.setSpacing(4)
-        for widget in (self.ck_run_at_login, self.ck_start_min, self.ck_sync_launch,
-                       self.ck_tray, self.ck_notify, self.ck_updates):
-            behaviour.addWidget(widget)
-        form.addRow(_flabel("Поведінка"), _row(behaviour))
-        return page
-
-    # ---------------------------------------------------- розділ «Додатково»
-    def _page_extra(self) -> QWidget:
-        page, form = _page("Мережа та обслуговування")
-
-        self.sp_timeout = QSpinBox()
-        self.sp_timeout.setRange(10, 600)
-        self.sp_timeout.setSuffix(" с")
-        self.sp_timeout.setFixedWidth(106)
-        self.sp_retries = QSpinBox()
-        self.sp_retries.setRange(1, 10)
-        self.sp_retries.setSuffix(" спроб")
-        self.sp_retries.setFixedWidth(124)
-        net = QHBoxLayout()
-        net.addWidget(QLabel("таймаут"))
-        net.addWidget(self.sp_timeout)
-        net.addWidget(QLabel("повтори"))
-        net.addWidget(self.sp_retries)
-        net.addStretch(1)
-        form.addRow(_flabel("Мережа"), _row(net))
-
-        self.ed_proxy = QLineEdit()
-        self.ed_proxy.setPlaceholderText("http://user:pass@host:port")
-        form.addRow(_flabel("Проксі"), self.ed_proxy)
-        form.addRow(_flabel(""), _hint("Лишити порожнім, якщо не потрібно."))
-
-        _gap(form)
-
-        self.btn_refresh_library = QPushButton("Оновити назви й метадані наявних файлів")
-        self.btn_refresh_library.setToolTip(
-            "Перейменовує вже завантажене за поточним шаблоном і дописує\n"
-            "опис та автора всередину файлів. Нічого не перекачує."
-        )
-        self.btn_refresh_library.clicked.connect(self.on_refresh_library)
-        self.btn_push_eagle = QPushButton("Імпортувати наявні файли в Eagle")
-        self.btn_push_eagle.setToolTip(
-            "Заливає в Eagle те, що вже лежить на диску.\n"
-            "Потрібно, якщо імпорт увімкнули після завантаження."
-        )
-        self.btn_push_eagle.clicked.connect(self.on_push_eagle)
-        self.btn_describe = QPushButton(DESCRIBE_LABEL)
-        self.btn_describe.setToolTip(
-            "Показує моделі те, що вже лежить у Eagle, і дописує опис та теги.\n"
-            "Синхронізація описує лише нові пости — стару бібліотеку вона не чіпає."
-        )
-        self.btn_describe.clicked.connect(self.on_describe_library)
-        self.btn_dupes = QPushButton("Знайти дублікати в Eagle")
-        self.btn_dupes.setToolTip(
-            "Шукає в бібліотеці кілька елементів на один пост Instagram.\n"
-            "Спершу лише показує; видаляти чи ні — вирішуєш ти."
-        )
-        self.btn_dupes.clicked.connect(self.on_find_dupes)
-        self.btn_normalize = QPushButton("Вирівняти теги за словником")
-        self.btn_normalize.setToolTip(
-            "Проганяє збережені теги моделі через поточний словник і виправляє\n"
-            "вже імпортовані елементи Eagle. Без запитів до моделі."
-        )
-        self.btn_normalize.clicked.connect(self.on_normalize_tags)
-        self.btn_vocab = QPushButton("Звіт про словник тегів")
-        self.btn_vocab.setToolTip("Перевикористані й мертві теги — де словник не працює")
-        self.btn_vocab.clicked.connect(self.on_vocab_report)
-        self.btn_given_up = QPushButton("Пости, від яких відмовились")
-        self.btn_given_up.setToolTip(
-            "Пости, які не вдалось узяти після кількох спроб.\n"
-            "Можна подивитись причини і повернути їх у чергу."
-        )
-        self.btn_given_up.clicked.connect(self.on_given_up)
-        self.btn_shortcut = QPushButton("Ярлик на робочому столі")
-        self.btn_shortcut.setToolTip("Створює ярлик із нормальною іконкою замість .bat")
-        self.btn_shortcut.clicked.connect(self.on_make_shortcut)
-        self.btn_clear_downloads = QPushButton("Очистити папку завантажень")
-        self.btn_clear_downloads.setToolTip(
-            "Видаляє завантажені файли, але памʼятає, що вони вже качались —\n"
-            "дублі не зʼявляться. Eagle не чіпається."
-        )
-        self.btn_clear_downloads.clicked.connect(self.on_clear_downloads)
-        self.btn_forget_downloads = QPushButton("Забути історію завантажень")
-        self.btn_forget_downloads.setToolTip(
-            "Очищає локальну базу, щоб наступний запуск перекачав усе заново.\n"
-            "Самі файли на диску не чіпаються."
-        )
-        self.btn_forget_downloads.clicked.connect(self.on_reset_state)
-        self.btn_reset_settings = QPushButton("Скинути налаштування")
-        self.btn_reset_settings.clicked.connect(self.on_reset_settings)
-
-        actions = QVBoxLayout()
-        actions.setSpacing(6)
-        for widget in (self.btn_refresh_library, self.btn_push_eagle, self.btn_describe,
-                       self.btn_dupes, self.btn_normalize, self.btn_vocab,
-                       self.btn_given_up, self.btn_shortcut,
-                       self.btn_clear_downloads, self.btn_forget_downloads,
-                       self.btn_reset_settings):
-            widget.setMinimumHeight(34)
-            actions.addWidget(widget)
-        form.addRow(_flabel("Обслуговування"), _row(actions))
-        return page
-
-    # ------------------------------------------------------------- вкладка 3
-    def _tab_session(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 12, 14, 14)
-        layout.setSpacing(10)
-
-        box_auto = QGroupBox("Автоматично з браузера")
-        auto = QHBoxLayout(box_auto)
-        self.cb_browser = QComboBox()
-        for key, label in BROWSER_LABELS.items():
-            self.cb_browser.addItem(label, key)
-        self.btn_find_cookie = QPushButton("Знайти сесію")
-        self.btn_find_cookie.clicked.connect(self.on_find_cookie)
-        self.btn_cookies_file = QPushButton("З файлу cookies.txt…")
-        self.btn_cookies_file.clicked.connect(self.on_cookies_file)
-        auto.addWidget(self.cb_browser, 1)
-        auto.addWidget(self.btn_find_cookie)
-        auto.addWidget(self.btn_cookies_file)
-        layout.addWidget(box_auto)
-
-        box_manual = QGroupBox("Вручну")
-        manual = QVBoxLayout(box_manual)
-        manual.addWidget(_label(MANUAL_HELP, "muted"))
-        row = QHBoxLayout()
-        self.ed_session = QLineEdit()
-        self.ed_session.setEchoMode(QLineEdit.Password)
-        self.ed_session.setPlaceholderText("sessionid…")
-        self.ck_show_session = QCheckBox("Показати")
-        self.ck_show_session.toggled.connect(
-            lambda on: self.ed_session.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password)
-        )
-        self.btn_verify = QPushButton("Перевірити")
-        self.btn_verify.setProperty("role", "primary")
-        self.btn_verify.clicked.connect(self.on_verify_session)
-        row.addWidget(self.ed_session, 1)
-        row.addWidget(self.ck_show_session)
-        row.addWidget(self.btn_verify)
-        manual.addLayout(row)
-        layout.addWidget(box_manual)
-
-        self.lbl_session = _label("", "muted")
-        layout.addWidget(self.lbl_session)
-
-        self.session_log = QPlainTextEdit()
-        self.session_log.setObjectName("log")
-        self.session_log.setReadOnly(True)
-        self.session_log.setMaximumBlockCount(400)
-        layout.addWidget(self.session_log, 1)
-
-        bottom = QHBoxLayout()
-        bottom.addStretch(1)
-        self.btn_forget = QPushButton("Забути сесію")
-        self.btn_forget.clicked.connect(self.on_forget_session)
-        bottom.addWidget(self.btn_forget)
-        layout.addLayout(bottom)
-        return page
 
     # ============================================================ конфіг ↔ UI
     def _load_config_into_ui(self) -> None:
@@ -1494,6 +729,8 @@ class MainWindow(QMainWindow):
         self._update_schedule_label()
         self._update_totals()
         self._update_tag_badge()
+        self._update_last_run()
+        self._ui_loaded = True
 
     def _collect_ui_into_config(self) -> None:
         cfg = self.cfg
@@ -1888,7 +1125,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self.btn_refresh_library.setEnabled(False)
         self.btn_start.setEnabled(False)
         self.progress.setRange(0, 0)
@@ -1917,7 +1154,7 @@ class MainWindow(QMainWindow):
         self._collect_ui_into_config()
         self.cfg.save()
 
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self.btn_push_eagle.setEnabled(False)
         self.progress.setRange(0, 0)
         self.progress.setFormat("Заливаю в Eagle…")
@@ -1995,7 +1232,7 @@ class MainWindow(QMainWindow):
                 return
             redo = True
 
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self.btn_describe.setText("Зупинити опис")
         self.progress.setRange(0, 0)
         self.progress.setFormat("Описую бібліотеку…")
@@ -2030,7 +1267,7 @@ class MainWindow(QMainWindow):
             return
         self._collect_ui_into_config()
         self.cfg.save()
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self._log("═══ Вирівнювання тегів за словником ═══")
         self.normalize_worker = NormalizeWorker(self.cfg, self.state, parent=self)
         self.normalize_worker.line.connect(self._log)
@@ -2076,7 +1313,7 @@ class MainWindow(QMainWindow):
             self.dupe_worker.stop()
             return
         self._collect_ui_into_config()
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self.progress.setRange(0, 0)
         self.progress.setFormat("Шукаю дублікати…")
         self._log("═══ Пошук дублікатів у Eagle ═══")
@@ -2154,7 +1391,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        self.tabs.setCurrentIndex(0)
+        self._go(PAGE_OVERVIEW)
         self.btn_clear_downloads.setEnabled(False)
         self.progress.setRange(0, 0)
         self.progress.setFormat("Чищу папку…")
@@ -2550,23 +1787,35 @@ class MainWindow(QMainWindow):
             self.status_label.setProperty("role", "warn")
         self._restyle(self.status_label)
 
-    def _open_session_tab(self) -> None:
-        """Не за номером: вкладок побільшало, і жорсткий індекс уже двічі
-        вказував не туди після кожної нової."""
-        self.tabs.setCurrentIndex(getattr(self, "session_index", self.tabs.count() - 1))
-
     def _set_review_badge(self, pending: int) -> None:
-        """Тільки напис на вкладці. Викликається щоразу, коли черга змінилась.
+        """Кількість у бічній панелі й на кнопці огляду — щоразу, коли черга змінилась.
 
         Вкладка встигає повідомити про кількість ще під час власної побудови,
-        коли посилання на неї у вікні ще немає — тому перевіряємо явно.
+        коли бічної панелі ще немає — тому перевіряємо явно.
         """
-        tab = getattr(self, "review_tab", None)
-        if tab is None:
+        sidebar = getattr(self, "sidebar", None)
+        if sidebar is None or sidebar.count() <= PAGE_REVIEW:
             return
-        index = self.tabs.indexOf(tab)
-        if index >= 0:
-            self.tabs.setTabText(index, f"Ревʼю ({pending})" if pending else "Ревʼю")
+        sidebar.item(PAGE_REVIEW).setText(f"Перегляд ({pending})" if pending else "Перегляд")
+        button = getattr(self, "btn_goto_review", None)
+        if button is not None:
+            button.setText(f"Перегляд: {pending} чекає" if pending else "Перегляд: порожньо")
+        self._update_last_run()
+
+    def _update_last_run(self) -> None:
+        label = getattr(self, "lbl_last_run", None)
+        if label is None:
+            return
+        last = status.read()
+        left = self.state.hours_since_last_run()
+        if last and last.when_human:
+            where = "за розкладом" if last.source == "scheduled" else "з вікна"
+            text = f"Останній запуск {last.when_human} ({where}): {last.summary or last.headline}"
+        elif left is not None:
+            text = f"Останній прохід {left:.1f} год тому."
+        else:
+            text = "Ще жодного проходу не було."
+        label.setText(text)
 
     def _refresh_review_badge(self) -> None:
         """Перечитати чергу з бази — після синхронізації та на старті."""

@@ -84,13 +84,23 @@ def _seed_review(state: State, root: Path):
     return keep, drop
 
 
-def test_window_builds_with_all_tabs(window):
+def test_window_builds_with_all_pages(window):
+    """Бічна панель: кожен розділ — одна тема, всередині — підвкладки."""
     from igsaved import APP_NAME, __version__
+    from igsaved.ui import main_window as mw
 
     assert window.windowTitle() == f"{APP_NAME} {__version__}"
-    assert [window.tabs.tabText(i) for i in range(window.tabs.count())][:2] == \
-        ["Синхронізація", "Налаштування"]
-    assert window.nav.count() == 7
+    assert [window.sidebar.item(i).text() for i in range(window.sidebar.count())] == \
+        mw.PAGE_TITLES
+    assert window.stack.count() == len(mw.PAGE_TITLES)
+    sync = window.stack.widget(mw.PAGE_SYNC)
+    assert [sync.subtabs.tabText(i) for i in range(sync.subtabs.count())] == \
+        ["Підбірки", "Що качати", "Обхід", "Лайки та фільтр"]
+    window._go(mw.PAGE_ACCOUNT, 1)
+    assert window.stack.currentIndex() == mw.PAGE_ACCOUNT
+    assert window.stack.widget(mw.PAGE_ACCOUNT).subtabs.currentIndex() == 1
+    window._open_session_tab()
+    assert window.stack.widget(mw.PAGE_ACCOUNT).subtabs.currentIndex() == 0
     for widget in (window.sp_jitter, window.sp_attempts, window.sp_rate_cooldown,
                    window.sp_sec_per_frame, window.ck_by_scene, window.sp_backlog,
                    window.cb_dupe, window.btn_normalize, window.btn_vocab,
@@ -198,7 +208,7 @@ def test_quick_start_indicators_reflect_health(window):
     window._refresh_status()
     assert "не підключена" in window.ind_session.text.text()
     window._on_health({"eagle": (False, "nope"), "model": (True, "qwen")})
-    assert "Модель: qwen" in window.ind_model.text.text()
+    assert window.ind_model.text.text() == "qwen"
     assert window.ind_model.button.isHidden() or not window.ind_model.button.isVisible()
 
 
@@ -207,3 +217,33 @@ def test_update_notice_appears_for_a_newer_release(window):
     assert window.update_notice.isVisibleTo(window)
     assert "99.0.0" in window.update_text.text()
     assert window.state.get_meta("last_update_check")
+
+
+def test_switching_pages_autosaves_settings(window):
+    """Забуте «Зберегти» коштувало налаштувань — тепер перехід зберігає сам."""
+    from igsaved.ui import main_window as mw
+
+    saved = []
+    window.cfg.save = lambda *a, **k: saved.append(True)
+    window.sp_jitter.setValue(11)
+    window._go(mw.PAGE_ABOUT)
+    assert window.cfg.schedule_jitter_minutes == 11 and saved
+
+
+def test_review_badge_shows_in_sidebar_and_overview(window):
+    from igsaved.ui import main_window as mw
+
+    _seed_review(window.state, Path(window.cfg.download_dir))
+    window.review_tab.reload()
+    assert window.sidebar.item(mw.PAGE_REVIEW).text() == "Перегляд (3)"
+    assert "3" in window.btn_goto_review.text()
+
+
+def test_about_page_offers_one_click_update(window):
+    window._on_update_checked({"version": "9.0.0", "url": "u", "notes": "notes", "assets": []})
+    assert window.btn_update.isEnabled()
+    assert window.btn_update.text() == "Оновити до 9.0.0"
+    assert window.update_notes.toPlainText() == "notes"
+    window._manual_check = True
+    window._on_update_checked(None)
+    assert "найновіша" in window.lbl_update.text()

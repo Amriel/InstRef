@@ -81,6 +81,38 @@ QLabel[role="thumb"] {{
     font-size: 11px;
 }}
 
+QListWidget#sidebar {{
+    background: {PANEL};
+    border: none;
+    border-right: 1px solid {BORDER};
+    padding: 10px 8px;
+    outline: none;
+    font-size: 14px;
+}}
+QListWidget#sidebar::item {{
+    padding: 0 14px;
+    border-radius: 8px;
+    margin: 2px 0;
+    color: {MUTED};
+}}
+QListWidget#sidebar::item:selected {{
+    background: {PANEL_2};
+    color: {TEXT};
+    border-left: 3px solid {ACCENT};
+}}
+QListWidget#sidebar::item:hover:!selected {{ background: {PANEL_2}; color: {TEXT}; }}
+QFrame#bottombar {{
+    background: {PANEL};
+    border-top: 1px solid {BORDER};
+}}
+QFrame[role="status"] {{
+    background: {PANEL_2};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+QFrame[role="status"] QLabel[role="title"] {{ font-size: 14px; font-weight: 600; color: {TEXT}; }}
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{ padding: 8px 16px; }}
 QListWidget#nav {{
     background: {BG};
     border: 1px solid {BORDER};

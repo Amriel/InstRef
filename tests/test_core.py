@@ -3756,3 +3756,44 @@ def test_transcription_is_optional_and_silent_without_whisper(tmp_path, monkeypa
     assert transcribe.transcribe(tmp_path / "x.mp4") == ""
     note = annotation("c", "d", "", "we bake the normals first")
     assert "Voice-over: we bake the normals first" in note
+
+
+def test_source_update_replaces_code_but_never_user_files(tmp_path):
+    """«Оновити» з вихідників: код заміняється, config/state/session — ні."""
+    import zipfile
+
+    from igsaved.updater import apply_source_archive
+
+    root = tmp_path / "proj"
+    (root / "igsaved").mkdir(parents=True)
+    (root / "igsaved" / "old.py").write_text("old")
+    (root / "config.json").write_text('{"mine": true}')
+    (root / "state.db").write_bytes(b"db")
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref")
+
+    archive = tmp_path / "src.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("Amriel-InstRef-abc123/igsaved/old.py", "new")
+        bundle.writestr("Amriel-InstRef-abc123/igsaved/added.py", "added")
+        bundle.writestr("Amriel-InstRef-abc123/config.json", '{"theirs": true}')
+        bundle.writestr("Amriel-InstRef-abc123/InstRef.bat", "echo a\necho b\n")
+        bundle.writestr("Amriel-InstRef-abc123/.git/HEAD", "hijack")
+
+    copied = apply_source_archive(archive, root)
+    assert copied == 3
+    assert (root / "igsaved" / "old.py").read_text() == "new"
+    assert (root / "igsaved" / "added.py").read_text() == "added"
+    assert (root / "config.json").read_text() == '{"mine": true}'
+    assert (root / "state.db").read_bytes() == b"db"
+    assert (root / ".git" / "HEAD").read_text() == "ref"
+    assert (root / "InstRef.bat").read_bytes() == b"echo a\r\necho b\r\n"
+
+
+def test_installer_asset_is_picked_from_release_assets():
+    from igsaved.updates import installer_asset
+
+    latest = {"assets": [{"name": "InstRef-2.4.0-portable.zip", "url": "z"},
+                         {"name": "InstRef-Setup-2.4.0.exe", "url": "e", "size": 5}]}
+    assert installer_asset(latest)["url"] == "e"
+    assert installer_asset({"assets": []}) is None

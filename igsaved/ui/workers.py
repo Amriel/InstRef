@@ -300,6 +300,32 @@ class UpdateWorker(QThread):
         self.done.emit(updates.check(self.current))
 
 
+class UpgradeWorker(QThread):
+    """Скачує й ставить оновлення (інсталятор або архів вихідників)."""
+
+    progress = Signal(str, int, int)
+    line = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, latest: dict, parent=None):
+        super().__init__(parent)
+        self.latest = latest
+
+    def run(self) -> None:
+        from .. import updater
+
+        try:
+            message = updater.update(
+                self.latest, progress=lambda m, d, t: self.progress.emit(m, d, t))
+        except updater.UpdateError as exc:
+            self.done.emit(False, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit(False, f"{exc.__class__.__name__}: {exc}")
+            return
+        self.done.emit(True, message)
+
+
 class SyncWorker(QThread):
     """Повний прохід синхронізації."""
 

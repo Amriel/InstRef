@@ -38,11 +38,33 @@ def fetch_latest(timeout: int = 6) -> Optional[dict]:
         return None
     if not isinstance(data, dict) or not data.get("tag_name"):
         return None
+    assets = []
+    for asset in data.get("assets") or []:
+        if not isinstance(asset, dict):
+            continue
+        assets.append({
+            "name": str(asset.get("name") or ""),
+            "url": str(asset.get("browser_download_url") or ""),
+            "size": int(asset.get("size") or 0),
+        })
     return {
         "version": str(data.get("tag_name") or "").lstrip("v"),
+        "tag": str(data.get("tag_name") or ""),
         "url": str(data.get("html_url") or RELEASES_URL),
         "name": str(data.get("name") or ""),
+        "notes": str(data.get("body") or ""),
+        "zipball": str(data.get("zipball_url") or ""),
+        "assets": assets,
     }
+
+
+def installer_asset(latest: dict) -> Optional[dict]:
+    """Інсталятор у релізі — те, що качає й запускає зібраний застосунок."""
+    for asset in (latest or {}).get("assets") or []:
+        name = asset.get("name", "").lower()
+        if name.startswith("instref-setup") and name.endswith(".exe"):
+            return asset
+    return None
 
 
 def check(current: str, timeout: int = 6) -> Optional[dict]:

@@ -76,6 +76,20 @@ Python 3.10+. On Windows `install.bat` does the same thing in one click.
 
 ---
 
+## The window
+
+A sidebar with one section per topic: **Overview** (status of session, Eagle
+and model, last run, queue, log, the Sync button), **Sync** (collections,
+what to download, how to walk, likes filter), **Review**, **Model**, **Eagle**,
+**Account** (session, account protection, schedule), **Maintenance** and
+**About**. Each section has sub-tabs; settings save themselves when you switch
+sections.
+
+**About** has an **Update** button. The installed app downloads the installer
+from the latest GitHub release and runs it; a source checkout downloads the
+release archive, replaces the code while leaving your settings, database,
+session and vocabulary alone, refreshes dependencies and restarts.
+
 ## Getting started
 
 1. **Connect a session.** Open the *Session* tab. InstRef tries to read the
@@ -171,7 +185,9 @@ Nothing reaches Eagle before you have seen it.
 ## Configuration notes
 
 Settings, the database and logs live in `%APPDATA%\InstRef` and survive
-uninstalling. The tag vocabulary is `taxonomy.json` in the same folder — edit it
+uninstalling. (Running from source keeps them next to the code instead — the
+two do not share data, so after switching to the installer you connect the
+session once more.) The tag vocabulary is `taxonomy.json` in the same folder — edit it
 by hand if you like; updates never overwrite it.
 
 Any setting left empty means "use the built-in default", which is how app
