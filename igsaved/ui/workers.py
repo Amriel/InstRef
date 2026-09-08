@@ -368,3 +368,29 @@ class SyncWorker(QThread):
         )
         stats: Stats = engine.run(only_collections=self.collections, force=self.force)
         self.done.emit(stats)
+
+
+class ExtrasWorker(QThread):
+    """Установка/видалення додаткових пакетів: pip довгий, вікно має жити."""
+
+    line = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, action: str, key: str, parent=None):
+        super().__init__(parent)
+        self.action = action          # install | remove | model
+        self.key = key                # ключ компонента або розмір моделі
+
+    def run(self) -> None:
+        from .. import extras
+
+        try:
+            if self.action == "install":
+                message = extras.install(self.key, self.line.emit)
+            elif self.action == "remove":
+                message = extras.uninstall(self.key, self.line.emit)
+            else:
+                message = extras.download_model(self.key, self.line.emit)
+            self.done.emit(True, message)
+        except Exception as exc:  # noqa: BLE001 — текст іде людині як є
+            self.done.emit(False, str(exc))

@@ -37,10 +37,12 @@ def main() -> int:
 
     from . import APP_NAME
     from .config import resource_dir
+    from .extras import ensure_path
     from .ui import theme
     from .ui.main_window import MainWindow
 
     _claim_taskbar_identity()
+    ensure_path()          # додатки з «Обслуговування → Додатки»
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

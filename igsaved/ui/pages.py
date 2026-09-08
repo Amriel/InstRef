@@ -307,8 +307,11 @@ class PagesMixin:
         self.ck_transcribe = QCheckBox("Транскрибувати голос за кадром (faster-whisper)")
         self.ck_transcribe.setToolTip(
             "Туторіали пояснюють техніку словами — кадри цього не передають.\n"
-            "Потрібен пакет faster-whisper: pip install faster-whisper."
+            "Потрібен пакет faster-whisper — ставиться кнопкою в «Обслуговування → Додатки»."
         )
+        self.btn_goto_extras = QPushButton("Встановити…")
+        self.btn_goto_extras.setToolTip("Відкриє «Обслуговування → Додатки»")
+        self.btn_goto_extras.clicked.connect(self._open_extras)
         self.ed_whisper = QLineEdit()
         self.ed_whisper.setPlaceholderText("small")
         self.ed_whisper.setFixedWidth(120)
@@ -316,6 +319,7 @@ class PagesMixin:
         transcribe_row = QHBoxLayout()
         transcribe_row.addWidget(self.ck_transcribe)
         transcribe_row.addWidget(self.ed_whisper)
+        transcribe_row.addWidget(self.btn_goto_extras)
         transcribe_row.addStretch(1)
         form.addRow(_flabel(""), _row(transcribe_row))
         form.addRow(_flabel(""), _hint(
@@ -490,6 +494,17 @@ class PagesMixin:
             "ролик з'являється в бібліотеці двічі-тричі."
         )
         form.addRow(_flabel(""), self.ck_eagle_once)
+
+        self.ck_eagle_check_library = QCheckBox("Звіряти з бібліотекою перед імпортом")
+        self.ck_eagle_check_library.setToolTip(
+            "Перед відправкою застосунок читає, що вже лежить у Eagle, і\n"
+            "пропускає наявне. Без цього він вірить лише власній базі — а вона\n"
+            "нічого не знає про те, що імпортували руками чи до скидання історії."
+        )
+        form.addRow(_flabel(""), self.ck_eagle_check_library)
+        form.addRow(_flabel(""), _hint(
+            "Знімок бібліотеки читається один раз за прохід. На дуже великих "
+            "бібліотеках це кілька секунд — дешевше, ніж чистити дублікати."))
 
         _gap(form)
 
@@ -884,6 +899,74 @@ class PagesMixin:
         misc.addWidget(self.btn_reset_settings)
         misc.addStretch(1)
         form.addRow(_flabel("Інше"), _row(misc))
+        return box
+
+    # ============================================================== Додатки
+    def _sec_extras(self) -> QWidget:
+        """Важкі необовʼязкові пакети — кнопкою, а не з консолі."""
+        from ..extras import COMPONENTS, WHISPER_SIZES
+
+        box, form = _section(
+            "Додатки",
+            "Те, що не влізло в інсталятор: важке й потрібне не кожному. "
+            "Ставиться в теку застосунку й підхоплюється після установки — "
+            "консоль не потрібна.")
+
+        self.extras_rows = {}
+        for comp in COMPONENTS:
+            state = _label("перевіряю…", "hint")
+            install = QPushButton("Встановити")
+            install.setMinimumHeight(32)
+            install.clicked.connect(lambda _=False, key=comp.key: self.on_install_extra(key))
+            remove = QPushButton("Видалити")
+            remove.clicked.connect(lambda _=False, key=comp.key: self.on_remove_extra(key))
+            buttons = QHBoxLayout()
+            buttons.addWidget(install)
+            buttons.addWidget(remove)
+            buttons.addStretch(1)
+            column = QVBoxLayout()
+            column.setSpacing(4)
+            column.addWidget(state)
+            column.addWidget(_row(buttons))
+            column.addWidget(_hint(f"{comp.hint} Розмір: {comp.size}."))
+            form.addRow(_flabel(comp.title.split(" (")[0]), _row(column))
+            self.extras_rows[comp.key] = (state, install, remove)
+
+        _gap(form)
+
+        self.cb_whisper_size = QComboBox()
+        self.cb_whisper_size.addItems(WHISPER_SIZES)
+        self.cb_whisper_size.setFixedWidth(140)
+        self.btn_whisper_model = QPushButton("Завантажити модель")
+        self.btn_whisper_model.setToolTip(
+            "Ваги моделі тягнуться при першому використанні — мовчки й довго.\n"
+            "Краще зробити це наперед і бачити прогрес."
+        )
+        self.btn_whisper_model.clicked.connect(self.on_download_whisper_model)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.cb_whisper_size)
+        model_row.addWidget(self.btn_whisper_model)
+        model_row.addStretch(1)
+        form.addRow(_flabel("Модель розшифровки"), _row(model_row))
+        form.addRow(_flabel(""), _hint(
+            "tiny — швидко й приблизно, small — розумний компроміс, "
+            "medium і large — точно, але довго на процесорі. "
+            "Розмір тут має збігатися з тим, що вказано на сторінці «Модель»."))
+
+        _gap(form)
+
+        self.lbl_extras_python = _label("", "hint")
+        self.btn_extras_refresh = QPushButton("Перевірити ще раз")
+        self.btn_extras_refresh.clicked.connect(self.refresh_extras)
+        python_row = QHBoxLayout()
+        python_row.addWidget(self.btn_extras_refresh)
+        python_row.addStretch(1)
+        form.addRow(_flabel("Чим ставити"), _row(_left(self.lbl_extras_python)))
+        form.addRow(_flabel(""), _row(python_row))
+        form.addRow(_flabel(""), _hint(
+            "Колеса з бінарними розширеннями сумісні лише з тією ж версією "
+            "Python, на якій зібраний застосунок. Якщо такої в системі немає, "
+            "застосунок завантажить компактну збірку з python.org сам."))
         return box
 
     # ======================================================= Про застосунок

@@ -129,6 +129,9 @@ class SyncEngine:
         self.eagle: Optional[EagleClient] = None
         self.eagle_root: Optional[str] = None
         self._eagle_queue: List[tuple] = []  # (folder_id, EagleItem, media_pk, collection_pk)
+        # Знімок бібліотеки Eagle: адреса поста → теки, у яких він там лежить.
+        # None — «не питали або не відповіли»; тоді покладаємось лише на базу.
+        self._eagle_present: Optional[Dict[str, set]] = None
 
     # ================================================================== запуск
     def cooldown_left(self) -> float:
@@ -1263,6 +1266,61 @@ class SyncEngine:
             self.log(f"Eagle: не вдалось створити папку — {exc}")
             return
         self.eagle = client
+        self._load_eagle_library()
+
+    def _load_eagle_library(self) -> None:
+        """Що вже лежить у бібліотеці — за адресою поста.
+
+        Наша база памʼятає тільки власні відправки. Після перевстановлення,
+        «забути історію», ручного імпорту або роботи з другого компʼютера вона
+        каже «цього в Eagle немає» — і Eagle отримує другу копію того самого
+        ролика (на кожен імпорт він КОПІЮЄ файл). Тому питаємо саму бібліотеку
+        і заразом лікуємо базу: те, що знайшлось, позначаємо як імпортоване.
+        """
+        self._eagle_present = None
+        if not self.eagle or not getattr(self.cfg, "eagle_check_library", True):
+            return
+        try:
+            by_url = self.state.media_by_url()
+            present: Dict[str, set] = {}
+            repaired = total = 0
+            for item in self.eagle.iter_items():
+                total += 1
+                url = str(item.get("url") or "").rstrip("/")
+                if not url:
+                    continue
+                folders = {str(f) for f in (item.get("folders") or []) if f}
+                present.setdefault(url, set()).update(folders)
+                pk = by_url.get(url)
+                item_id = str(item.get("id") or "")
+                if not pk:
+                    continue
+                if not self.state.is_in_eagle(pk):
+                    self.state.mark_in_eagle(pk, "", next(iter(folders), ""), item_id)
+                    repaired += 1
+                elif item_id:
+                    self.state.set_eagle_item_id(pk, item_id)
+            self._eagle_present = present
+            note = f", з них {len(present)} із посиланням на пост" if present else ""
+            self.log(f"Eagle: у бібліотеці {total} елемент(ів){note}.")
+            if repaired:
+                self.log(f"   ⤼ {repaired} з них база вважала невідправленими — "
+                         "виправив, дублікатів не буде.")
+        except EagleError as exc:
+            # Не знаємо — не вигадуємо. Далі працює стара перевірка по базі.
+            self.log(f"Eagle: список бібліотеки не прийшов ({exc}); "
+                     "перевіряю дублікати лише за своєю базою.")
+
+    def _in_eagle_library(self, url: str, folder_id: Optional[str]) -> bool:
+        """Чи цей пост уже в бібліотеці (а при потребі — саме в цій теці)."""
+        if self._eagle_present is None or not url:
+            return False
+        folders = self._eagle_present.get(str(url).rstrip("/"))
+        if folders is None:
+            return False
+        if self.cfg.eagle_one_item_per_post or not folder_id:
+            return True
+        return str(folder_id) in folders
 
     def _eagle_folder(self, col: CollectionInfo) -> Optional[str]:
         if not self.eagle:
@@ -1310,22 +1368,35 @@ class SyncEngine:
             tags=unique,
         )
 
-    def _already_in_eagle(self, pk: str, collection_pk: str) -> bool:
+    def _already_in_eagle(self, pk: str, collection_pk: str, url: str = "",
+                          folder_id: Optional[str] = None) -> bool:
         """Один пост — один елемент, якщо не сказано інакше.
 
         Eagle копіює файл на кожен імпорт, тож «додати той самий ролик ще й у
         папку лайків» означає другу копію в бібліотеці, а не другу полицю.
+        Питаємо два джерела: власну базу і знімок самої бібліотеки — база знає
+        лише про свої відправки й після скидання історії впевнено помиляється.
         """
+        if self._in_eagle_library(url, folder_id):
+            return True
         if self.cfg.eagle_one_item_per_post:
             return self.state.is_in_eagle(pk)
         return self.state.is_in_eagle(pk, collection_pk)
+
+    def _remember_in_eagle(self, pk: str, collection_pk: str,
+                           folder_id: Optional[str]) -> None:
+        """Пост знайшовся в бібліотеці — записати це, щоб не шукати вдруге."""
+        if pk and not self.state.is_in_eagle(pk, collection_pk):
+            self.state.mark_in_eagle(pk, collection_pk, folder_id or "")
 
     def _queue_eagle(self, media, col: CollectionInfo, paths: List[Path]) -> None:
         if not self.eagle:
             return
         folder_id = self._eagle_folder(col)
         pk = str(getattr(media, "pk", ""))
-        if self._already_in_eagle(pk, col.pk):
+        url = media_url(getattr(media, "code", "") or "")
+        if self._already_in_eagle(pk, col.pk, url, folder_id):
+            self._remember_in_eagle(pk, col.pk, folder_id)
             return
         # Пост міг потрапити в чергу двічі за один прохід — по підбірці й по
         # лайках. Позначаємо одразу, а не після відправки.
@@ -1346,7 +1417,11 @@ class SyncEngine:
         if not self.eagle:
             return
         pk = str(getattr(media, "pk", ""))
-        if self._already_in_eagle(pk, col.pk) or self.state.is_pending_review(pk):
+        url = media_url(getattr(media, "code", "") or "")
+        if self.state.is_pending_review(pk):
+            return
+        if self._already_in_eagle(pk, col.pk, url, self._eagle_folder(col)):
+            self._remember_in_eagle(pk, col.pk, self._eagle_folder(col))
             return
         paths = [Path(p) for p in self.state.media_files(pk) if Path(p).exists()]
         if paths:
@@ -1360,6 +1435,7 @@ class SyncEngine:
         for folder_id, item, pk, col_pk in self._eagle_queue:
             grouped.setdefault(folder_id, []).append(item)
             marks.append((pk, col_pk, folder_id))
+        sent_items = list(self._eagle_queue)
         self._eagle_queue = []
 
         for folder_id, items in grouped.items():
@@ -1372,3 +1448,8 @@ class SyncEngine:
                 return
         for pk, col_pk, folder_id in marks:
             self.state.mark_in_eagle(pk, col_pk, folder_id or "")
+        if self._eagle_present is not None:
+            for _folder_id, item, _pk, _col_pk in sent_items:
+                url = str(getattr(item, "website", "") or "").rstrip("/")
+                if url:
+                    self._eagle_present.setdefault(url, set()).add(_folder_id or "")

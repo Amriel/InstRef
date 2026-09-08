@@ -23,6 +23,8 @@ from typing import List, Optional, Sequence
 
 import requests
 
+from .useful import useful_tags
+
 # Категорії, якими оперує модель. Свідомо короткі й непересічні.
 MEME = "meme"
 ART = "art"
@@ -400,6 +402,10 @@ class VisionClient:
             )
         verdict = parse_answer(str(answer))
         verdict.frames = len(shots)
+        # Користь видно з тексту, а не з кадру: «10 websites for…», «how to…».
+        # Модель дивиться на картинку й описує студію — ознаку дає текст.
+        verdict.tags = list(verdict.tags) + useful_tags(
+            verdict.on_screen_text, caption, transcript)
         if self.taxonomy is not None:
             # Інструкцію модель порушує, цю перевірку — ні.
             verdict.tags, verdict.dropped = self.taxonomy.normalize(verdict.tags, mode)

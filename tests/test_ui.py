@@ -260,3 +260,35 @@ def test_model_list_is_filled_from_health_check(window):
     window.cb_vision_model.setCurrentIndex(1)
     window._collect_ui_into_config()
     assert window.cfg.vision_model == "qwen3.8-27b"       # без помітки
+
+
+def test_extras_tab_shows_state_and_offers_buttons(window, monkeypatch):
+    """«Не хочу в консоль лазити»: важкі пакети ставляться кнопкою."""
+    from igsaved import extras
+    from igsaved.ui import main_window as mw
+
+    monkeypatch.setattr(extras, "is_installed", lambda comp: False)
+    monkeypatch.setattr(extras, "installed_version", lambda comp: "")
+    monkeypatch.setattr(extras, "python_label", lambda: "Python 3.12 застосунку")
+    window._go(mw.PAGE_MAINTENANCE, 1)
+    label, install, remove = window.extras_rows["whisper"]
+    assert "не встановлено" in label.text()
+    assert install.text() == "Встановити" and not remove.isEnabled()
+    assert window.lbl_extras_python.text() == "Python 3.12 застосунку"
+    assert not window.btn_whisper_model.isEnabled()
+
+    monkeypatch.setattr(extras, "is_installed", lambda comp: True)
+    monkeypatch.setattr(extras, "installed_version", lambda comp: "1.2.0")
+    window.refresh_extras()
+    assert "1.2.0" in label.text()
+    assert install.text() == "Перевстановити" and remove.isEnabled()
+    assert window.btn_whisper_model.isEnabled()
+
+
+def test_eagle_library_check_is_a_setting(window):
+    window.ck_eagle_check_library.setChecked(False)
+    window._collect_ui_into_config()
+    assert window.cfg.eagle_check_library is False
+    window.cfg.eagle_check_library = True
+    window._load_config_into_ui()
+    assert window.ck_eagle_check_library.isChecked()

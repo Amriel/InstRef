@@ -3838,3 +3838,162 @@ def test_installed_update_waits_for_the_app_to_exit_then_relaunches(monkeypatch,
     assert "/SILENT" in text and "/LOG=" in text
     assert text.index("InstRef-Setup-9.exe") < text.index('start "" ')
     assert 'start "" "' + str(tmp_path / "InstRef.exe") in text
+
+
+# ==========================================================================
+#  Звірка з реальною бібліотекою Eagle
+# ==========================================================================
+def test_library_snapshot_stops_the_second_copy(tmp_path):
+    """«Дуже часто дублікати додає»: база памʼятає лише власні відправки.
+
+    Після «забути історію», перевстановлення чи ручного імпорту вона впевнено
+    каже «цього в Eagle немає» — і Eagle отримує другу копію того самого
+    ролика. Тепер перед імпортом читається сама бібліотека.
+    """
+    from igsaved.instagram import CollectionInfo, media_url
+
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        media = FakeMedia(pk="777", code="ZZZ")
+        col = CollectionInfo("ALL_MEDIA_AUTO_COLLECTION", "Усі збережені", 0,
+                             is_all_saved=True)
+        engine.eagle = object()
+        engine._eagle_folder = lambda c: "folder-1"
+        # база порожня, але пост уже лежить у бібліотеці
+        engine._eagle_present = {media_url("ZZZ").rstrip("/"): {"folder-1"}}
+
+        engine._queue_eagle(media, col, [Path("a.mp4")])
+        assert engine._eagle_queue == []
+        # і база вилікувалась — наступного разу питати бібліотеку не доведеться
+        assert state.is_in_eagle("777")
+    finally:
+        state.close()
+
+
+def test_library_snapshot_reads_eagle_and_repairs_the_database(tmp_path):
+    from igsaved.instagram import media_url
+
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        state.record_media("777", "ZZZ", "user", None, 2, "clips", "",
+                           media_url("ZZZ"))
+
+        class FakeEagle:
+            def iter_items(self, folder_ids=None):
+                return iter([
+                    {"id": "ITEM1", "url": media_url("ZZZ"), "folders": ["F1"]},
+                    {"id": "ITEM2", "url": "", "folders": []},
+                ])
+
+        engine.eagle = FakeEagle()
+        engine._load_eagle_library()
+        assert engine._eagle_present == {media_url("ZZZ").rstrip("/"): {"F1"}}
+        assert state.is_in_eagle("777")
+        assert state.eagle_item_ids() == {"777": "ITEM1"}
+    finally:
+        state.close()
+
+
+def test_library_check_can_be_switched_off(tmp_path):
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        cfg.eagle_check_library = False
+        engine.eagle = object()
+        engine._load_eagle_library()
+        assert engine._eagle_present is None
+    finally:
+        state.close()
+
+
+# ==========================================================================
+#  Позначка «корисне»
+# ==========================================================================
+def test_useful_tags_recognise_a_list_of_websites():
+    """Ролик «10 niche websites for vibe coders» виглядає як звичайна студія —
+    користь видно лише з тексту на екрані, і модель її не позначала."""
+    from igsaved.useful import useful_tags
+
+    tags = useful_tags(
+        "10/10 niche websites for vibe coders | Refero Styles | Cult-ui | "
+        "Comment \"CODE\" and I'll send you the links", "", "")
+    assert "resource-list" in tags and "useful" in tags and "link-in-bio" in tags
+
+
+def test_useful_tags_recognise_advice_and_tutorials():
+    from igsaved.useful import useful_tags
+
+    assert "tips" in useful_tags("Stop using Pinterest for every moodboard.")
+    steps = useful_tags("How to fake volumetrics in Blender in 3 steps")
+    assert {"tutorial", "software-tip", "useful"} <= set(steps)
+
+
+def test_useful_tags_stay_silent_on_plain_footage():
+    """Позначка має щось значити: якщо ставити її всім, вона нічого не фільтрує."""
+    from igsaved.useful import useful_tags
+
+    assert useful_tags("", "Sunset over the ocean, shot on a long lens", "") == []
+    assert useful_tags("") == []
+
+
+def test_useful_tags_survive_the_vocabulary_check():
+    """Тег, якого немає у словнику, викидається після відповіді — і позначка
+    зникла б мовчки."""
+    from igsaved.taxonomy import Taxonomy
+    from igsaved.useful import useful_tags
+
+    kept, dropped = Taxonomy().normalize(
+        useful_tags("Here are 5 free plugins for After Effects"), "video")
+    assert "useful" in kept and not dropped
+
+
+# ==========================================================================
+#  Додатки (установка без консолі)
+# ==========================================================================
+def test_extras_use_the_running_python_when_started_from_source():
+    from igsaved import extras
+
+    assert extras.find_python() == sys.executable
+    assert "Python" in extras.python_label()
+
+
+def test_extras_embed_urls_walk_down_from_the_current_patch():
+    """Embeddable-збірки є не для кожного патча — треба мати запасні."""
+    from igsaved import extras
+
+    urls = extras.embed_urls()
+    assert urls[0].endswith(
+        f"python-{sys.version_info.major}.{sys.version_info.minor}"
+        f".{sys.version_info.micro}-embed-amd64.zip")
+    assert len(urls) == sys.version_info.micro + 1
+
+
+def test_extras_uninstall_removes_only_its_own_files(tmp_path, monkeypatch):
+    """pip uninstall не вміє --target, тож видаляємо за RECORD — і тільки своє."""
+    from igsaved import extras
+
+    packages = tmp_path / "packages"
+    (packages / "faster_whisper").mkdir(parents=True)
+    (packages / "faster_whisper" / "__init__.py").write_text("x")
+    info = packages / "faster_whisper-1.0.0.dist-info"
+    info.mkdir()
+    (info / "RECORD").write_text(
+        "faster_whisper/__init__.py,sha256=x,10\n"
+        "faster_whisper-1.0.0.dist-info/RECORD,,\n", encoding="utf-8")
+    stranger = packages / "requests"
+    stranger.mkdir()
+    (stranger / "__init__.py").write_text("y")
+
+    monkeypatch.setattr(extras, "PACKAGES_DIR", packages)
+    extras.uninstall("whisper")
+    assert not (packages / "faster_whisper").exists()
+    assert not info.exists()
+    assert (stranger / "__init__.py").exists()
+
+
+def test_extras_status_says_plainly_that_nothing_is_installed(tmp_path, monkeypatch):
+    from igsaved import extras
+
+    monkeypatch.setattr(extras, "PACKAGES_DIR", tmp_path / "nope")
+    monkeypatch.setattr(extras, "installed_version", lambda comp: "")
+    monkeypatch.setattr(extras, "is_installed", lambda comp: False)
+    assert extras.status(extras.component("whisper")) == (False, "не встановлено")

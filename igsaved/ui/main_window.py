@@ -43,8 +43,8 @@ from .review_tab import ReviewTab
 from .widgets import _csv, _label, _same_prompt, _scrollable, _stack_page, _subtabs
 from .workers import (
     CleanupWorker, CollectionsWorker, ConnectWorker, CookieWorker, DescribeWorker,
-    DupeWorker, HealthWorker, NormalizeWorker, PushWorker, RefreshWorker, SyncWorker,
-    UpdateWorker, UpgradeWorker, UrlWorker,
+    DupeWorker, ExtrasWorker, HealthWorker, NormalizeWorker, PushWorker, RefreshWorker,
+    SyncWorker, UpdateWorker, UpgradeWorker, UrlWorker,
 )
 
 EAGLE_DEFAULT_URL = "http://localhost:41595"
@@ -79,6 +79,7 @@ class MainWindow(PagesMixin, QMainWindow):
         self.health_worker: Optional[HealthWorker] = None
         self.update_worker: Optional[UpdateWorker] = None
         self.upgrade_worker: Optional[UpgradeWorker] = None
+        self.extras_worker: Optional[ExtrasWorker] = None
         self._manual_check = False
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
@@ -215,6 +216,11 @@ class MainWindow(PagesMixin, QMainWindow):
             self.review_tab.setFocus()
         if index == PAGE_MODEL and not getattr(self, "_models_loaded", False):
             self._check_health()
+        if index == PAGE_MAINTENANCE:
+            self.refresh_extras()
+
+    def _open_extras(self) -> None:
+        self._go(PAGE_MAINTENANCE, 1)
 
     def _open_session_tab(self) -> None:
         self._go(PAGE_ACCOUNT, 0)
@@ -398,6 +404,7 @@ class MainWindow(PagesMixin, QMainWindow):
         layout.addWidget(_label("Обслуговування", "h1"))
         page.subtabs = _subtabs(
             ("Файли й база", _stack_page("", self._sec_files())),
+            ("Додатки", _stack_page("", self._sec_extras())),
             ("Мережа", _stack_page("", self._sec_network())),
         )
         layout.addWidget(page.subtabs, 1)
@@ -553,6 +560,80 @@ class MainWindow(PagesMixin, QMainWindow):
             except OSError as exc:
                 self._log(f"Не вдалось перезапустити сам: {exc}. Запусти InstRef ще раз.")
         QTimer.singleShot(800, self._quit_app)
+
+    # ------------------------------------------------------------- додатки
+    def refresh_extras(self) -> None:
+        """Перечитує стан компонентів — на вході у вкладку і після дій."""
+        rows = getattr(self, "extras_rows", None)
+        if not rows:
+            return
+        from .. import extras
+
+        busy = bool(self.extras_worker and self.extras_worker.isRunning())
+        for key, (label, install, remove) in rows.items():
+            comp = extras.component(key)
+            ok, text = extras.status(comp)
+            label.setText(("✔ " if ok else "— ") + text)
+            install.setText("Перевстановити" if ok else "Встановити")
+            install.setEnabled(not busy)
+            remove.setEnabled(ok and not busy)
+        self.lbl_extras_python.setText(extras.python_label())
+        self.btn_whisper_model.setEnabled(
+            not busy and extras.is_installed(extras.component("whisper")))
+        size = self.ed_whisper.text().strip() or "small"
+        index = self.cb_whisper_size.findText(size)
+        if index >= 0 and not busy:
+            self.cb_whisper_size.setCurrentIndex(index)
+
+    def on_install_extra(self, key: str) -> None:
+        from .. import extras
+
+        comp = extras.component(key)
+        answer = QMessageBox.question(
+            self, APP_NAME,
+            f"Встановити «{comp.title}»?\n\n{comp.hint}\n\nЗавантаження: {comp.size}. "
+            "Триває кілька хвилин — вікно лишається робочим.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._start_extras("install", key, f"═══ Установка: {comp.title} ═══")
+
+    def on_remove_extra(self, key: str) -> None:
+        from .. import extras
+
+        comp = extras.component(key)
+        answer = QMessageBox.question(
+            self, APP_NAME, f"Видалити «{comp.title}»?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._start_extras("remove", key, f"═══ Видалення: {comp.title} ═══")
+
+    def on_download_whisper_model(self) -> None:
+        size = self.cb_whisper_size.currentText().strip() or "small"
+        self._start_extras("model", size, f"═══ Модель розшифровки «{size}» ═══")
+
+    def _start_extras(self, action: str, key: str, headline: str) -> None:
+        if self.extras_worker and self.extras_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Зачекай: попередня дія ще йде.")
+            return
+        self._log(headline)
+        self._go(PAGE_MAINTENANCE, 1)
+        self.extras_worker = ExtrasWorker(action, key, self)
+        self.extras_worker.line.connect(self._log)
+        self.extras_worker.done.connect(self._on_extras_done)
+        self.extras_worker.start()
+        self.refresh_extras()
+
+    def _on_extras_done(self, ok: bool, message: str) -> None:
+        self._log(("✔ " if ok else "✖ ") + message)
+        self.refresh_extras()
+        if ok:
+            QMessageBox.information(self, APP_NAME, message)
+        else:
+            QMessageBox.warning(self, APP_NAME, message)
 
     def _open_url(self, url: str) -> None:
         webbrowser.open(url)
@@ -722,6 +803,7 @@ class MainWindow(PagesMixin, QMainWindow):
         self.ed_eagle_root.setText(cfg.eagle_root_folder)
         self.ck_eagle_per_col.setChecked(cfg.eagle_folder_per_collection)
         self.ck_eagle_once.setChecked(cfg.eagle_one_item_per_post)
+        self.ck_eagle_check_library.setChecked(cfg.eagle_check_library)
         self.ck_eagle_cleanup.setChecked(cfg.eagle_delete_local_after_import)
         self.ck_eagle_tags.setChecked(cfg.eagle_tags_from_hashtags)
         self.ck_eagle_tag_author.setChecked(cfg.eagle_tag_author)
@@ -826,6 +908,7 @@ class MainWindow(PagesMixin, QMainWindow):
         cfg.eagle_root_folder = self.ed_eagle_root.text().strip() or "Instagram Saved"
         cfg.eagle_folder_per_collection = self.ck_eagle_per_col.isChecked()
         cfg.eagle_one_item_per_post = self.ck_eagle_once.isChecked()
+        cfg.eagle_check_library = self.ck_eagle_check_library.isChecked()
         cfg.eagle_delete_local_after_import = self.ck_eagle_cleanup.isChecked()
         cfg.eagle_tags_from_hashtags = self.ck_eagle_tags.isChecked()
         cfg.eagle_tag_author = self.ck_eagle_tag_author.isChecked()

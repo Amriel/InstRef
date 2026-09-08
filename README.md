@@ -101,7 +101,9 @@ session and vocabulary alone, refreshes dependencies and restarts.
 2. **Pick a folder** and which collections to sync. *Settings → Downloads*.
 
 3. **Connect Eagle** (optional). Eagle's local API only answers while the app
-   is open. *Settings → Eagle* → **Test connection**.
+   is open. *Settings → Eagle* → **Test connection**. Before every import
+   InstRef reads what the library already holds and skips it, so a post never
+   arrives twice — not after a reinstall, and not after items imported by hand.
 
 4. **Connect a model** (optional). In LM Studio load a vision model and start
    the server (*Developer → Start Server*). Paste the address in
@@ -125,8 +127,15 @@ It returns four things: a filing category, an English description written like
 a director's note, any **text visible on screen** (step titles, plugin names —
 what tutorials are actually searched by), and tags. Posts saved in a collection
 named like a tutorial get a hint to describe the technique, not the picture.
-Optionally, with `faster-whisper` installed, the voice-over is transcribed and
-handed to the model as context.
+Optionally the voice-over is transcribed and handed to the model as context —
+install it from *Maintenance → Extras* with one button, no console needed.
+
+Posts that **teach or give something** — a list of sites, a settings
+walkthrough, a workflow breakdown — look like any other clip to a vision model:
+the meaning sits in the on-screen text. Those are tagged by rules rather than
+by the model: `useful` plus `resource-list`, `tutorial`, `tips`,
+`workflow-breakdown`, `software-tip` and a few more, so advice stays findable
+next to the pretty footage.
 
 **Tags come from a controlled vocabulary.** `3d-render`, `3drender`, `render`
 and `3d` are four different tags to Eagle and none of them finds the others —

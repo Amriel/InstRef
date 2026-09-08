@@ -193,6 +193,13 @@ DEFAULT_CATEGORIES: List[Category] = [
         "crew-visible", "on-set", "product-in-use", "before-after", "unboxing",
         "ootd", "get-ready-with-me",
     ]),
+    Category("useful", "USEFUL / INFORMATIONAL", limit=4, tags=[
+        "useful", "tutorial", "tips", "resource-list", "tool-recommendation",
+        "workflow-breakdown", "software-tip", "explainer", "prompt-share",
+        "news-drop", "course-promo", "link-in-bio",
+    ], note="the post TEACHES or GIVES something: steps, a list of tools or "
+            "sites, a settings walkthrough. Always add `useful` together with "
+            "the specific one. Not for pretty footage that merely looks nice."),
     Category("aesthetic", "AESTHETIC", limit=1, tags=[
         "cinematic", "documentary-style", "vlog-style", "editorial-style",
         "commercial-style", "raw-footage", "polished", "lo-fi-aesthetic",

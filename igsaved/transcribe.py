@@ -10,13 +10,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-INSTALL_HINT = "pip install faster-whisper"
+INSTALL_HINT = "Обслуговування → Додатки → «Встановити»"
 MAX_CHARS = 1500
 
 _models: dict = {}
 
 
 def available() -> bool:
+    from .extras import ensure_path
+
+    ensure_path()          # пакет міг приїхати кнопкою «Встановити» в «Додатках»
     try:
         import faster_whisper  # noqa: F401
     except ImportError:

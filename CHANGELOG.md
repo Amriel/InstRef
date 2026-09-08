@@ -4,6 +4,30 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.0
+
+- **Optional components install from inside the app.** *Maintenance → Extras*
+  lists what is not bundled (voice transcription with faster-whisper), shows
+  whether it is installed and installs or removes it with one button. No
+  console, no `pip`: the installed build looks for a matching Python and, if
+  there is none, downloads a small one from python.org by itself. The same tab
+  downloads the whisper model up front, so the first run does not sit silent
+  for minutes.
+- **Eagle is asked what it already has.** Before importing, the app reads the
+  library and skips posts that are in it, instead of trusting only its own
+  database — which knows nothing about items you imported by hand, or about
+  anything from before "forget download history". This was the source of
+  repeated duplicates. Found items are written back into the database, so the
+  check costs one library read per run. Can be switched off under
+  *Eagle → Connection*.
+- **Useful posts get their own tags.** A reel that lists tools, explains a
+  workflow or walks through settings looks like any other clip to a vision
+  model — the meaning is in the on-screen text. Text is now matched by rules:
+  `useful` plus `resource-list`, `tutorial`, `tips`, `workflow-breakdown`,
+  `software-tip`, `prompt-share`, `explainer`, `news-drop`, `course-promo`,
+  `link-in-bio`. *Model → Vocabulary → Normalize* applies them to the existing
+  library without asking the model again.
+
 ## 2.4.5
 
 - Updating the installed app now works end to end. The helper waits until the

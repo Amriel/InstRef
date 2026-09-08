@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional
 
 from . import tagging
 from .config import Config
+from .instagram import media_url
 from .naming import (
     asset_name, caption_slug, hashtags, render_template, safe_component,
     short_title, unique_path,
@@ -339,6 +340,9 @@ def push_to_eagle(
         log("У базі нема завантажених постів — нема чого заливати.")
         return stats
 
+    present = (eagle_library_snapshot(client, state, log)
+               if getattr(cfg, "eagle_check_library", True) else None)
+
     log(f"Постів у базі: {len(posts)}")
     batch: Dict[Optional[str], List[EagleItem]] = {}
     marks: List[tuple] = []
@@ -365,9 +369,6 @@ def push_to_eagle(
             continue          # чекає на рішення — у бібліотеку ще зарано
         collection = post.collections[0] if post.collections else ""
         col_pk = post.collection_pks[0] if post.collection_pks else "root"
-        if _in_eagle(cfg, state, post.pk, col_pk):
-            stats.already += 1
-            continue
 
         folder_id = root
         if cfg.eagle_folder_per_collection and collection:
@@ -375,6 +376,13 @@ def push_to_eagle(
                 folder_id = client.ensure_folder(safe_component(collection, 60), root)
             except EagleError:
                 folder_id = root
+
+        if _in_eagle(cfg, state, post.pk, col_pk, present,
+                     media_url(post.code), folder_id or ""):
+            stats.already += 1
+            if not state.is_in_eagle(post.pk, col_pk):
+                state.mark_in_eagle(post.pk, col_pk, folder_id or "")
+            continue
 
         added = 0
         for path, idx in post.parts():
@@ -850,12 +858,68 @@ def find_eagle_duplicates(
     return stats
 
 
-def _in_eagle(cfg: Config, state: State, pk: str, collection_pk: str) -> bool:
+def _row_value(row, column: str) -> str:
+    """Значення стовпця, якого в старій базі може й не бути."""
+    try:
+        return str(row[column] or "")
+    except (IndexError, KeyError):
+        return ""
+
+
+def _in_eagle(cfg: Config, state: State, pk: str, collection_pk: str,
+              present: Optional[Dict[str, set]] = None, url: str = "",
+              folder_id: str = "") -> bool:
     """Та сама перевірка, що й у синхронізації — інакше кожна з них імпортує
-    той самий пост окремо, і в бібліотеці з'являється дубль."""
+    той самий пост окремо, і в бібліотеці з'являється дубль.
+
+    `present` — знімок реальної бібліотеки; він головніший за базу, бо база
+    знає лише про власні відправки."""
+    if present is not None and url:
+        folders = present.get(str(url).rstrip("/"))
+        if folders is not None:
+            if cfg.eagle_one_item_per_post or not folder_id:
+                return True
+            if str(folder_id) in folders:
+                return True
     if cfg.eagle_one_item_per_post:
         return state.is_in_eagle(pk)
     return state.is_in_eagle(pk, collection_pk)
+
+
+def eagle_library_snapshot(client, state: State, log=print) -> Optional[Dict[str, set]]:
+    """Адреса поста → теки Eagle, у яких він лежить. None — не вдалось спитати.
+
+    Заразом лікує базу: знайдене позначається як імпортоване, щоб наступного
+    разу питання «чи це вже там» вирішувалось локально.
+    """
+    from .eagle import EagleError
+
+    try:
+        by_url = state.media_by_url()
+        present: Dict[str, set] = {}
+        repaired = total = 0
+        for item in client.iter_items():
+            total += 1
+            url = str(item.get("url") or "").rstrip("/")
+            if not url:
+                continue
+            folders = {str(f) for f in (item.get("folders") or []) if f}
+            present.setdefault(url, set()).update(folders)
+            pk = by_url.get(url)
+            item_id = str(item.get("id") or "")
+            if not pk:
+                continue
+            if not state.is_in_eagle(pk):
+                state.mark_in_eagle(pk, "", next(iter(folders), ""), item_id)
+                repaired += 1
+            elif item_id:
+                state.set_eagle_item_id(pk, item_id)
+        log(f"Eagle: у бібліотеці {total} елемент(ів)."
+            + (f" Базі бракувало {repaired} — дописав." if repaired else ""))
+        return present
+    except EagleError as exc:
+        log(f"Eagle: список бібліотеки не прийшов ({exc}); звіряюсь лише з базою.")
+        return None
 
 
 def _by_url(urls: Dict[str, str], url) -> Optional[tuple]:
@@ -923,10 +987,12 @@ def normalize_library(
     """
     from . import taxonomy as taxonomy_mod
     from .eagle import EagleClient, EagleError
+    from .useful import useful_tags
 
     stats = NormalizeStats()
     tax = taxonomy_mod.Taxonomy.load()
     changes: Dict[tuple, tuple] = {}     # (pk, idx) → (старі, нові)
+    captions = state.captions_by_pk()
 
     for row in state.ai_meta_rows():
         if should_stop():
@@ -941,7 +1007,12 @@ def normalize_library(
         if files:
             target = files[min(max(idx - 1, 0), len(files) - 1)] if idx else files[0]
             mode = taxonomy_mod.mode_for(target)
-        new, _dropped = tax.normalize(old, mode)
+        # Позначка «корисне» рахується з тексту, тож її можна доставити
+        # заднім числом усій бібліотеці — без жодного запиту до моделі.
+        extra = useful_tags(_row_value(row, "screen_text"),
+                            captions.get(pk, ""),
+                            _row_value(row, "transcript"))
+        new, _dropped = tax.normalize(old + extra, mode)
         if [t.lower() for t in old] == [t.lower() for t in new]:
             continue
         stats.changed += 1

@@ -830,6 +830,15 @@ class State:
                 """
             ).fetchall()
 
+    def captions_by_pk(self) -> dict:
+        """pk → підпис поста. Потрібен, щоб перечитати бібліотеку правилами,
+        не питаючи модель удруге."""
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT pk, caption FROM media WHERE COALESCE(caption, '') <> ''"
+            ).fetchall()
+        return {str(row["pk"]): str(row["caption"]) for row in rows}
+
     def media_by_url(self) -> dict:
         """Посилання на пост → його pk. Потрібно, щоб упізнати елемент Eagle:
         своїх ідентифікаторів ми там не лишаємо, а адреса поста лишається."""
