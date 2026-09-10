@@ -19,6 +19,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 REVIEW_RULES = "rules"
 REVIEW_MODEL = "model"
 
+# Відстань, за якої одного кадру достатньо: це вже той самий кадр,
+# а не «схожа картинка». Далі потрібне підтвердження другим кадром.
+EXACT_DISTANCE = 2
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS media (
     pk            TEXT PRIMARY KEY,
@@ -168,6 +172,7 @@ class State:
                 # без копії відновлювати буде нізвідки.
                 self.backup("pre-migration")
             self._add_missing_columns()
+            self._drop_degenerate_fingerprints()
             self.db.commit()
 
     MISSING = (
@@ -179,6 +184,33 @@ class State:
         ("ai_meta", "transcript", "TEXT"),
         ("eagle_items", "item_id", "TEXT"),
     )
+
+    def _drop_degenerate_fingerprints(self) -> None:
+        """Разове прибирання відбитків із однотонних кадрів.
+
+        Вони потрапили в базу до того, як застосунок навчився їх відсіювати, і
+        кожен такий рядок — міна: він збігається з будь-яким іншим таким же на
+        відстань 0, і різні пости виглядають як один. Читання їх уже ігнорує,
+        але лишати сміття в базі означає плодити «вже є відбиток» там, де
+        насправді немає жодного.
+        """
+        from .frames import informative
+
+        try:
+            rows = self.db.execute("SELECT rowid, hash FROM fingerprints").fetchall()
+        except sqlite3.DatabaseError:
+            return
+        junk = []
+        for row in rows:
+            try:
+                value = int(str(row["hash"]), 16)
+            except ValueError:
+                junk.append(row["rowid"])
+                continue
+            if not informative(value):
+                junk.append(row["rowid"])
+        for rowid in junk:
+            self.db.execute("DELETE FROM fingerprints WHERE rowid = ?", (rowid,))
 
     def _needs_migration(self) -> bool:
         for table, column, _definition in self.MISSING:
@@ -717,8 +749,18 @@ class State:
 
     # ----------------------------------------------- перцептивні відбитки
     def set_fingerprints(self, media_pk: str, idx: int, hashes: Iterable[int]) -> None:
+        """Зберігає лише інформативні відбитки.
+
+        Однотонний кадр (чорна заставка, білий спалах) дає хеш, який збігається
+        з будь-яким іншим таким же — і зберігати його означає засівати базу
+        мінами на майбутнє.
+        """
+        from .frames import informative
+
         with self._lock:
             for value in hashes or []:
+                if not informative(value):
+                    continue
                 self.db.execute(
                     "INSERT OR IGNORE INTO fingerprints (media_pk, idx, hash) VALUES (?,?,?)",
                     (str(media_pk), int(idx or 0), format(int(value), "016x")),
@@ -744,21 +786,42 @@ class State:
                 continue
         return result
 
-    def find_similar(self, hashes: Iterable[int], max_distance: int = 8,
+    def find_similar(self, hashes: Iterable[int], max_distance: int = 6,
                      exclude_pk: str = "") -> Optional[tuple]:
-        """Найближчий уже відомий пост: (pk, відстань) або None."""
-        from .frames import hamming
+        """Найближчий уже відомий пост: (pk, відстань) або None.
 
-        best = None
+        Одного схожого кадру замало. Ролики в стрічці однотипні — вертикальні,
+        з титрами, з темними вставками, — і випадковий збіг ОДНОГО кадру
+        траплявся регулярно: різні пости їхали в ревʼю як «дубль». Тому
+        потрібне підтвердження: або дуже близький збіг (кадр той самий), або
+        щонайменше два кадри, що вказують на той самий пост.
+        """
+        from .frames import hamming, informative
+
         known = self.all_fingerprints()
+        best: dict = {}          # pk → (найменша відстань, скільки кадрів збіглось)
         for value in hashes or []:
+            if not informative(value):
+                continue          # однотонний кадр збігається з чим завгодно
+            closest: dict = {}
             for pk, other in known:
-                if pk == str(exclude_pk):
+                if pk == str(exclude_pk) or not informative(other):
                     continue
                 distance = hamming(value, other)
-                if distance <= max_distance and (best is None or distance < best[1]):
-                    best = (pk, distance)
-        return best
+                if distance <= max_distance:
+                    if pk not in closest or distance < closest[pk]:
+                        closest[pk] = distance
+            for pk, distance in closest.items():
+                prev_distance, hits = best.get(pk, (distance, 0))
+                best[pk] = (min(prev_distance, distance), hits + 1)
+
+        winner = None
+        for pk, (distance, hits) in best.items():
+            if hits < 2 and distance > EXACT_DISTANCE:
+                continue          # один випадковий кадр — не доказ
+            if winner is None or (distance, -hits) < (winner[1], -winner[2]):
+                winner = (pk, distance, hits)
+        return (winner[0], winner[1]) if winner else None
 
     def media_row(self, pk: str) -> Optional[sqlite3.Row]:
         with self._lock:

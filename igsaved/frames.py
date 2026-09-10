@@ -344,8 +344,28 @@ def hamming(a: int, b: int) -> int:
     return bin(int(a) ^ int(b)).count("1")
 
 
-def fingerprint(path: Path, samples: int = 3) -> List[int]:
-    """Кілька хешів файлу: для відео — з кадрів, для картинки — один."""
+# Скільки одиниць у 64-бітному dHash вважати ознакою «кадр щось містить».
+# Рівний кадр — чорна заставка, біла спалах-склейка, однотонний фон із лого —
+# дає майже всі нулі (або всі одиниці), і такі хеші збігаються МІЖ СОБОЮ на
+# нуль. Саме через них різні ролики виглядали як той самий: у базі
+# користувача три різні пости мали однаковий `0x3030000000`, а два — `0x0`.
+INFORMATIVE_MIN, INFORMATIVE_MAX = 12, 52
+
+
+def informative(value: Optional[int]) -> bool:
+    """Чи несе хеш інформацію, а не «кадр був однотонний»."""
+    if value is None:
+        return False
+    bits = bin(int(value)).count("1")
+    return INFORMATIVE_MIN <= bits <= INFORMATIVE_MAX
+
+
+def fingerprint(path: Path, samples: int = 5) -> List[int]:
+    """Кілька хешів файлу: для відео — з кадрів, для картинки — один.
+
+    Беремо із запасом і викидаємо вироджені: краще три відбитки, які щось
+    означають, ніж пʼять, серед яких два збігаються з половиною бібліотеки.
+    """
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix in VIDEO_EXT:
@@ -360,6 +380,6 @@ def fingerprint(path: Path, samples: int = 3) -> List[int]:
     result = []
     for shot in shots:
         value = dhash(shot)
-        if value is not None:
+        if informative(value):
             result.append(value)
     return result

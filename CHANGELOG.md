@@ -4,6 +4,20 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.1
+
+- **Fixed: unrelated posts were flagged as duplicates and parked in Review.**
+  The frame fingerprint (dHash) compares each pixel with the one to its right,
+  so a flat frame — a black opening, a white flash, a plain background — turns
+  into an all-zero hash that matches every other flat frame exactly. Reels
+  routinely start on one, so unrelated clips looked identical. Flat frames are
+  no longer fingerprinted, old ones are cleared from the database on start, and
+  a single matching frame is no longer enough: a duplicate now needs either a
+  near-exact frame or two frames pointing at the same post. On a real library
+  this took the false positives from 8 posts out of 34 down to none.
+  Anything already sitting in Review as a "possible duplicate" was one of
+  these — keep it with `Y`.
+
 ## 2.5.0
 
 - **Optional components install from inside the app.** *Maintenance → Extras*

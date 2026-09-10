@@ -1594,6 +1594,33 @@ def _make_video(path, count=60, size=(160, 120)):
     return path
 
 
+def _make_textured_video(path, count=60, size=(160, 120)):
+    """Ролик із малюнком у кадрі — для перевірок відбитків.
+
+    Однотонний кадр (і рівний градієнт теж) дає вироджений dHash, який
+    збігається з будь-яким іншим таким же. Саме через це різні пости їхали в
+    ревʼю як «дубль» — і саме тому тест на репости мусить мати кадри з
+    фактурою, інакше він проходить із хибної причини.
+    """
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    width, height = size
+    rng = np.random.default_rng(7)
+    pattern = cv2.resize(rng.integers(0, 255, (12, 16), dtype=np.uint8),
+                         (width, height), interpolation=cv2.INTER_NEAREST)
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 25, (width, height)
+    )
+    assert writer.isOpened()
+    for index in range(count):
+        frame = cv2.cvtColor(pattern, cv2.COLOR_GRAY2BGR)
+        frame[:, :, 0] = (int(frame[0, 0, 0]) + index) % 255
+        writer.write(frame)
+    writer.release()
+    return path
+
+
 def test_frames_extract_walks_the_whole_video(tmp_path):
     from igsaved import frames
 
@@ -3549,7 +3576,7 @@ def test_repost_of_a_known_post_is_held_for_review(tmp_path, monkeypatch):
         lines = []
         engine.log = lines.append
         cfg.root.mkdir(parents=True, exist_ok=True)
-        original = _make_video(cfg.root / "orig.mp4")
+        original = _make_textured_video(cfg.root / "orig.mp4")
         state.record_media("1", "AAA", "first", None, 2, "clips", "", "https://ig/AAA/",
                            status="done")
         state.add_file(str(original), "1", "video", 0, 1)
@@ -3997,3 +4024,58 @@ def test_extras_status_says_plainly_that_nothing_is_installed(tmp_path, monkeypa
     monkeypatch.setattr(extras, "installed_version", lambda comp: "")
     monkeypatch.setattr(extras, "is_installed", lambda comp: False)
     assert extras.status(extras.component("whisper")) == (False, "не встановлено")
+
+
+# ==========================================================================
+#  Хибні «дублі»: однотонний кадр збігається з усім
+# ==========================================================================
+def test_flat_frames_do_not_become_fingerprints():
+    """У базі користувача три РІЗНІ пости мали однаковий хеш 0x3030000000,
+    а два — 0x0: це чорні заставки на початку роликів. dHash порівнює пиксель
+    із сусідом праворуч, тож рівний кадр дає майже всі нулі — і збігається з
+    будь-яким іншим рівним кадром на відстань 0."""
+    from igsaved.frames import informative
+
+    assert not informative(0x0)                      # суцільно чорний кадр
+    assert not informative(0xFFFFFFFFFFFFFFFF)       # суцільно білий
+    assert not informative(0x3030000000)             # майже однотонний
+    assert not informative(None)
+    assert informative(0x976D95461DAAB524)           # кадр із фактурою
+
+
+def test_one_matching_frame_is_not_a_duplicate(tmp_path):
+    """«Воно подумало, що такі відео вже є»: збіг ОДНОГО кадру з тисяч
+    траплявся регулярно — ролики в стрічці однотипні. Потрібне підтвердження."""
+    from igsaved.state import State
+
+    state = State(tmp_path / "s.db")
+    try:
+        state.record_media("1", "AAA", "first", None, 2, "clips", "", "https://ig/AAA/")
+        state.set_fingerprints("1", 0, [0x976D95461DAAB524, 0x1234ABCD5678EF90])
+        # один кадр нового поста випадково близький, решта — ні
+        near = 0x976D95461DAAB524 ^ 0b111111          # відстань 6
+        assert state.find_similar([near, 0xF0F0F0F0AAAA5555]) is None
+        # два кадри вказують на той самий пост — це вже репост
+        second = 0x1234ABCD5678EF90 ^ 0b11            # відстань 2
+        assert state.find_similar([near, second]) == ("1", 2)
+        # один, але майже точний збіг — теж достатньо
+        assert state.find_similar([0x976D95461DAAB524 ^ 0b1]) == ("1", 1)
+    finally:
+        state.close()
+
+
+def test_degenerate_hashes_never_reach_the_database(tmp_path):
+    from igsaved.state import State
+
+    state = State(tmp_path / "s.db")
+    try:
+        state.set_fingerprints("1", 0, [0x0, 0x3030000000, 0x976D95461DAAB524])
+        assert [h for _pk, h in state.all_fingerprints()] == [0x976D95461DAAB524]
+        # і навіть якщо вироджений хеш лежить у базі зі старих часів —
+        # шукати за ним не можна
+        state.db.execute(
+            "INSERT INTO fingerprints (media_pk, idx, hash) VALUES ('2', 0, ?)",
+            (format(0x0, "016x"),))
+        assert state.find_similar([0x0, 0x3030000000]) is None
+    finally:
+        state.close()
