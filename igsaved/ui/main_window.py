@@ -781,6 +781,8 @@ class MainWindow(PagesMixin, QMainWindow):
         self.sp_vision_frames.setValue(max(1, min(VISION_MAX_FRAMES, cfg.vision_frames)))
         self._update_frames_note(self.sp_vision_frames.value())
         self.sp_vision_timeout.setValue(max(10, min(900, cfg.vision_timeout)))
+        self.ck_vision_unload.setChecked(cfg.vision_unload_after_run)
+        self.sp_vision_ttl.setValue(max(0, min(86400, int(cfg.vision_ttl_seconds or 0))))
         self.ck_vision_describe.setChecked(cfg.vision_describe_downloads)
         self.ck_model_glance.setChecked(cfg.model_needs_glance)
         self.ck_taxonomy.setChecked(cfg.taxonomy_enabled)
@@ -886,6 +888,8 @@ class MainWindow(PagesMixin, QMainWindow):
         )
         cfg.vision_frames = self.sp_vision_frames.value()
         cfg.vision_timeout = self.sp_vision_timeout.value()
+        cfg.vision_unload_after_run = self.ck_vision_unload.isChecked()
+        cfg.vision_ttl_seconds = self.sp_vision_ttl.value()
         cfg.vision_describe_downloads = self.ck_vision_describe.isChecked()
         cfg.model_needs_glance = self.ck_model_glance.isChecked()
         cfg.taxonomy_enabled = self.ck_taxonomy.isChecked()
@@ -1009,6 +1013,25 @@ class MainWindow(PagesMixin, QMainWindow):
             self.lbl_eagle.setText(text)
             self.lbl_eagle.setProperty("role", "ok")
         self._restyle(self.lbl_eagle)
+
+    def on_unload_model(self) -> None:
+        """Звільнити відеопамʼять прямо зараз — не чекаючи кінця проходу."""
+        from ..vision import VisionError, client_for
+
+        if self.sync_worker and self.sync_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Спершу дочекайся кінця синхронізації.")
+            return
+        self._collect_ui_into_config()
+        client = client_for(self.cfg)
+        try:
+            model = client.resolve_model()
+            client.unload()
+        except VisionError as exc:
+            self._log(f"Модель не вивантажилась: {exc}")
+            QMessageBox.warning(self, APP_NAME, str(exc))
+            return
+        self._log(f"Модель «{model}» вивантажено з LM Studio.")
+        QMessageBox.information(self, APP_NAME, f"Модель «{model}» вивантажено.")
 
     def on_test_vision(self) -> None:
         """Показує, які моделі зараз завантажені в LM Studio."""

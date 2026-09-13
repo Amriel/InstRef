@@ -294,6 +294,33 @@ class PagesMixin:
         )
         form.addRow(_flabel("Чекати відповідь до"), _row(_left(self.sp_vision_timeout)))
 
+        self.ck_vision_unload = QCheckBox("Вивантажувати модель після проходу")
+        self.ck_vision_unload.setToolTip(
+            "LM Studio тримає завантажену модель, доки не скажуть інакше,\n"
+            "а це кілька гігабайт відеопамʼяті між проходами."
+        )
+        self.sp_vision_ttl = QSpinBox()
+        self.sp_vision_ttl.setRange(0, 86400)
+        self.sp_vision_ttl.setSuffix(" с")
+        self.sp_vision_ttl.setSpecialValueText("не надсилати")
+        self.sp_vision_ttl.setFixedWidth(140)
+        self.sp_vision_ttl.setToolTip(
+            "TTL у запиті: LM Studio сама звільнить памʼять через стільки\n"
+            "секунд простою. Страхує, якщо застосунок не встиг вивантажити."
+        )
+        self.btn_vision_unload = QPushButton("Вивантажити зараз")
+        self.btn_vision_unload.clicked.connect(self.on_unload_model)
+        unload_row = QHBoxLayout()
+        unload_row.addWidget(self.ck_vision_unload)
+        unload_row.addWidget(self.sp_vision_ttl)
+        unload_row.addWidget(self.btn_vision_unload)
+        unload_row.addStretch(1)
+        form.addRow(_flabel("Памʼять"), _row(unload_row))
+        form.addRow(_flabel(""), _hint(
+            "Вивантаження по HTTP вміє LM Studio 0.4.0 і новіша. Модель, яку ти "
+            "завантажив руками у вікні LM Studio, TTL не чіпає — її знімає саме ця "
+            "галочка."))
+
         _gap(form)
 
         self.ck_vision_describe = QCheckBox("Писати опис і теги для кожного нового поста")

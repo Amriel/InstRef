@@ -292,3 +292,19 @@ def test_eagle_library_check_is_a_setting(window):
     window.cfg.eagle_check_library = True
     window._load_config_into_ui()
     assert window.ck_eagle_check_library.isChecked()
+
+
+def test_memory_row_controls_unloading(window):
+    """«Модель залишається висіти в LM Studio» — тепер це налаштування й кнопка."""
+    window.ck_vision_unload.setChecked(False)
+    window.sp_vision_ttl.setValue(120)
+    window._collect_ui_into_config()
+    assert window.cfg.vision_unload_after_run is False
+    assert window.cfg.vision_ttl_seconds == 120
+
+    window.cfg.vision_unload_after_run = True
+    window.cfg.vision_ttl_seconds = 900
+    window._load_config_into_ui()
+    assert window.ck_vision_unload.isChecked()
+    assert window.sp_vision_ttl.value() == 900
+    assert window.btn_vision_unload.isEnabled()

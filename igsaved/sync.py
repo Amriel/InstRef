@@ -253,6 +253,7 @@ class SyncEngine:
                 self._flush_eagle()
             except Exception:  # noqa: BLE001
                 pass
+            self._unload_vision()
             self._clear_cache()
             self.dl.close()
             self.state.finish_run(
@@ -351,6 +352,7 @@ class SyncEngine:
                 self._flush_eagle()
             except Exception:  # noqa: BLE001
                 pass
+            self._unload_vision()
             self._clear_cache()
             self.dl.close()
             lock.release()
@@ -449,6 +451,25 @@ class SyncEngine:
         elif action == "skip":
             verdict.decision = SKIP
         return verdict
+
+    def _unload_vision(self) -> None:
+        """Звільняє відеопамʼять під моделлю після проходу.
+
+        LM Studio тримає завантажену модель, доки не скажуть інакше, — а це
+        кілька гігабайт VRAM між проходами, які трапляються раз на кілька
+        годин. Вивантаження тут, у finally: воно має статись і після помилки,
+        і після зупинки користувачем.
+        """
+        client = self._vision
+        if client is None or not getattr(self.cfg, "vision_unload_after_run", True):
+            return
+        try:
+            model = client.unload()
+        except vision.VisionError as exc:
+            self.log(f"Модель лишилась у памʼяті: {exc}")
+            return
+        if model:
+            self.log(f"Модель «{model}» вивантажено з LM Studio.")
 
     def _setup_vision(self):
         """Готує клієнта LM Studio. Недоступна модель не має нічого ламати."""

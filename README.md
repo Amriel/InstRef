@@ -127,6 +127,10 @@ It returns four things: a filing category, an English description written like
 a director's note, any **text visible on screen** (step titles, plugin names —
 what tutorials are actually searched by), and tags. Posts saved in a collection
 named like a tutorial get a hint to describe the technique, not the picture.
+When a run ends, InstRef asks LM Studio to unload the model, so a few
+gigabytes of VRAM are not held between runs; *Model → Connection → Memory* has
+the switch, a TTL as a fallback, and an "Unload now" button.
+
 Optionally the voice-over is transcribed and handed to the model as context —
 install it from *Maintenance → Extras* with one button, no console needed.
 

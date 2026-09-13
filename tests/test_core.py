@@ -4079,3 +4079,102 @@ def test_degenerate_hashes_never_reach_the_database(tmp_path):
         assert state.find_similar([0x0, 0x3030000000]) is None
     finally:
         state.close()
+
+
+# ==========================================================================
+#  Модель не має висіти в памʼяті після проходу
+# ==========================================================================
+def test_unload_asks_lm_studio_to_free_the_model():
+    """Після проходу кілька гігабайт VRAM тримались зайнятими до перезапуску
+    LM Studio: застосунок просто нікому не казав, що модель більше не потрібна."""
+    from igsaved.vision import VisionClient, api_root
+
+    assert api_root("http://127.0.0.1:1234/v1") == "http://127.0.0.1:1234"
+    assert api_root("http://box:1234") == "http://box:1234"
+
+    calls = []
+
+    class FakeResponse:
+        status_code, ok = 200, True
+
+    client = VisionClient("http://127.0.0.1:1234/v1", model="qwen3-vl-4b-instruct")
+    client.session.post = lambda url, json=None, timeout=None: (
+        calls.append((url, json)) or FakeResponse())
+    assert client.unload() == "qwen3-vl-4b-instruct"
+    assert calls == [("http://127.0.0.1:1234/api/v1/models/unload",
+                      {"instance_id": "qwen3-vl-4b-instruct"})]
+
+
+def test_old_lm_studio_says_so_instead_of_failing_silently():
+    from igsaved.vision import VisionClient, VisionError
+
+    class NotFound:
+        status_code, ok = 404, False
+
+    client = VisionClient("http://127.0.0.1:1234/v1", model="m")
+    client.session.post = lambda *a, **k: NotFound()
+    with pytest.raises(VisionError, match="0.4.0"):
+        client.unload()
+
+
+def test_ttl_travels_with_the_request(monkeypatch):
+    """Страховка на випадок падіння: LM Studio звільнить памʼять сама."""
+    from igsaved import vision
+
+    sent = {}
+
+    class FakeResponse:
+        def raise_for_status(self): pass
+        def json(self): return {"choices": [{"message": {"content": "{}"}}]}
+
+    client = vision.VisionClient("http://x/v1", model="m", ttl=900)
+    client.session.post = lambda url, json=None, timeout=None: (
+        sent.update(json) or FakeResponse())
+    client.classify([b"frame"])
+    assert sent["ttl"] == 900
+
+    quiet = vision.VisionClient("http://x/v1", model="m", ttl=0)
+    sent.clear()
+    quiet.session.post = lambda url, json=None, timeout=None: (
+        sent.update(json) or FakeResponse())
+    quiet.classify([b"frame"])
+    assert "ttl" not in sent
+
+
+def test_run_unloads_the_model_even_after_an_error(tmp_path):
+    from igsaved.vision import VisionError
+
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        lines = []
+        engine.log = lines.append
+
+        class FakeClient:
+            def __init__(self): self.unloaded = False
+            def unload(self):
+                self.unloaded = True
+                return "qwen3-vl-4b-instruct"
+
+        engine._vision = FakeClient()
+        engine._unload_vision()
+        assert engine._vision.unloaded
+        assert any("вивантажено" in line for line in lines)
+
+        # вимкнено в налаштуваннях — не чіпаємо
+        cfg.vision_unload_after_run = False
+        engine._vision = FakeClient()
+        engine._unload_vision()
+        assert not engine._vision.unloaded
+
+        # стара LM Studio: кажемо вголос, а не мовчимо
+        cfg.vision_unload_after_run = True
+        lines.clear()
+
+        class Grumpy:
+            def unload(self): raise VisionError("потрібна 0.4.0+")
+
+        engine._vision = Grumpy()
+        engine._unload_vision()
+        assert any("лишилась у памʼяті" in line for line in lines)
+    finally:
+        state.close()

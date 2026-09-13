@@ -4,6 +4,18 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.2
+
+- **The model no longer stays loaded in LM Studio after a run.** LM Studio keeps
+  a loaded model in memory until something tells it otherwise, so a 4B vision
+  model sat on several gigabytes of VRAM between runs that happen once every few
+  hours. InstRef now asks it to unload when the run ends — including after an
+  error or a manual stop — and sends a TTL with each request so LM Studio frees
+  the memory by itself if the app never got the chance. Both live under
+  *Model → Connection → Memory*, together with an "Unload now" button.
+  Unloading over HTTP needs LM Studio 0.4.0 or newer; on older versions the app
+  says so instead of failing quietly.
+
 ## 2.5.1
 
 - **Fixed: unrelated posts were flagged as duplicates and parked in Review.**

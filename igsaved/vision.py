@@ -69,6 +69,23 @@ def looks_visual(model_id: str) -> bool:
     return any(mark in name for mark in VISUAL_MARKS)
 
 
+def api_root(url: str) -> str:
+    """Корінь сервера з адреси OpenAI-сумісного API.
+
+    Рідні ендпоінти LM Studio (`/api/v1/...`) живуть поруч із `/v1`, а не
+    всередині нього: http://localhost:1234/v1 → http://localhost:1234.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(normalize_url(url))
+    path = parts.path.rstrip("/")
+    for suffix in ("/v1", "/api/v0", "/api/v1"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return urlunsplit((parts.scheme, parts.netloc, path, "", "")).rstrip("/")
+
+
 def normalize_url(url: str) -> str:
     """Дописує /v1, якщо його немає.
 
@@ -284,20 +301,48 @@ def client_for(cfg, taxonomy=None) -> "VisionClient":
     return VisionClient(
         cfg.vision_url, cfg.vision_model, cfg.vision_timeout,
         cfg.vision_min_confidence, prompt=cfg.vision_prompt, taxonomy=taxonomy,
+        ttl=int(getattr(cfg, "vision_ttl_seconds", 0) or 0),
     )
 
 
 class VisionClient:
     def __init__(self, base_url: str = DEFAULT_URL, model: str = "",
                  timeout: int = 60, min_confidence: float = 0.55,
-                 prompt: str = "", taxonomy=None):
+                 prompt: str = "", taxonomy=None, ttl: int = 0):
         self.base_url = normalize_url(base_url)
         self.model = (model or "").strip()
         self.timeout = timeout
         self.min_confidence = min_confidence
         self.prompt = prompt or ""
         self.taxonomy = taxonomy
+        self.ttl = int(ttl or 0)
         self.session = requests.Session()
+
+    # ------------------------------------------------------------ вивантаження
+    def unload(self) -> str:
+        """Просить LM Studio звільнити памʼять під моделлю. Повертає підсумок.
+
+        Модель на 4B важить кілька гігабайт відеопамʼяті, і після проходу вона
+        там уже не потрібна — а LM Studio тримає завантажене, доки не скажуть
+        інакше. TTL у запиті рятує лише JIT-завантажені моделі; ту, що людина
+        завантажила руками у вікні LM Studio, вивантажує тільки це.
+        """
+        model = (self.model or "").strip()
+        if not model:
+            return ""
+        url = f"{api_root(self.base_url)}/api/v1/models/unload"
+        try:
+            resp = self.session.post(url, json={"instance_id": model}, timeout=15)
+        except requests.RequestException as exc:
+            raise VisionError(f"не вдалось звернутись до LM Studio: {_short(exc)}") from exc
+        if resp.status_code == 404:
+            # v1 з'явився в LM Studio 0.4.0; у старіших вивантаження по HTTP немає.
+            raise VisionError(
+                "ця версія LM Studio не вміє вивантажувати модель по HTTP "
+                "(потрібна 0.4.0+). Допоможе TTL — модель зникне сама.")
+        if not resp.ok:
+            raise VisionError(f"LM Studio відповів {resp.status_code}")
+        return model
 
     # ------------------------------------------------------------ перевірка
     def list_models(self) -> List[str]:
@@ -377,6 +422,11 @@ class VisionClient:
             "max_tokens": 600,
             "messages": [{"role": "user", "content": content}],
         }
+        if self.ttl > 0:
+            # LM Studio вивантажує модель через стільки секунд простою. Це
+            # страхує на випадок, коли застосунок упав і вивантажити явно не
+            # встиг: інакше модель висить у памʼяті до перезапуску LM Studio.
+            payload["ttl"] = int(self.ttl)
         try:
             resp = self.session.post(
                 f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout

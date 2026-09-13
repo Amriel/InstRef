@@ -728,6 +728,14 @@ def describe_library(
                               model, answer.frames, idx=idx, prompt_hash=current_hash,
                               screen_text=answer.on_screen_text)
 
+    if getattr(cfg, "vision_unload_after_run", True):
+        # Кілька гігабайт VRAM не мають висіти після того, як опис закінчено.
+        try:
+            unloaded = client.unload()
+            if unloaded:
+                log(f"Модель «{unloaded}» вивантажено з LM Studio.")
+        except vision.VisionError as exc:
+            log(f"Модель лишилась у памʼяті: {exc}")
     log(f"Готово: {stats.summary()}")
     return stats
 
