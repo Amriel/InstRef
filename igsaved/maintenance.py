@@ -599,7 +599,10 @@ def describe_library(
         log(stats.error)
         return stats
 
-    folders = _our_folder_ids(eagle, cfg, log)
+    whole = bool(getattr(cfg, "describe_whole_library", False))
+    folders = None if whole else _our_folder_ids(eagle, cfg, log)
+    if whole:
+        log("Дивлюсь усю бібліотеку, не лише теку застосунку.")
     try:
         if folders and not eagle.list_items(folders, limit=1):
             # Фільтр за теками в різних збірках Eagle поводиться по-різному.

@@ -4,6 +4,14 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.5
+
+- **Describe the whole Eagle library, not only the app's own folder.** Until now
+  every library pass was filtered to "Instagram Saved" and its subfolders, so a
+  library of 1,351 items reported 266 — correctly, but not usefully: a reference
+  library is searched as a whole, and everything brought in by hand stayed
+  untagged. *Eagle → Library* now has a switch for it.
+
 ## 2.5.4
 
 - **Fixed: the app only ever saw the first 200 items of the Eagle library.**

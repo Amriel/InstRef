@@ -323,3 +323,13 @@ def test_stale_code_warning_appears_once(window, monkeypatch, tmp_path):
     assert window._warn_if_code_changed() is True
     assert window.banner.isVisibleTo(window)
     assert window._warn_if_code_changed() is False      # вдруге не набридаємо
+
+
+def test_whole_library_describe_is_a_setting(window):
+    """266 елементів проти 1351 у Eagle: застосунок дивився лише свою теку."""
+    window.ck_describe_whole.setChecked(True)
+    window._collect_ui_into_config()
+    assert window.cfg.describe_whole_library is True
+    window.cfg.describe_whole_library = False
+    window._load_config_into_ui()
+    assert not window.ck_describe_whole.isChecked()

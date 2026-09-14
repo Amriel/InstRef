@@ -625,6 +625,13 @@ class PagesMixin:
             "Після кожної синхронізації описати ще стільки елементів без опису. "
             "Десяток за прохід непомітний, а за місяць покриває стару бібліотеку."))
 
+        self.ck_describe_whole = QCheckBox("Описувати всю бібліотеку, а не лише теку застосунку")
+        self.ck_describe_whole.setToolTip(
+            "У бібліотеці лежить не лише завантажене цим застосунком.\n"
+            "З галочкою модель опише і те, що ти приніс туди сам."
+        )
+        form.addRow(_flabel(""), self.ck_describe_whole)
+
         self.btn_describe = QPushButton(DESCRIBE_LABEL)
         self.btn_describe.setToolTip(
             "Описати одразу багато: спробувати на 20, все, лише застарілі\n"
