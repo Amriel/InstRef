@@ -4218,3 +4218,54 @@ def test_source_stamp_notices_replaced_files(tmp_path):
     newer = before + 120
     os.utime(pkg / "ui" / "pages.py", (newer, newer))
     assert source_stamp(pkg) > before
+
+
+# ==========================================================================
+#  Бібліотека Eagle більша за одну сторінку
+# ==========================================================================
+class _PagedEagle:
+    """Сервер, у якого offset означає ту чи іншу річ — як у різних збірках Eagle."""
+
+    def __init__(self, total: int, mode: str, page: int = 200):
+        self.items = [{"id": f"I{i}", "url": f"https://ig/p/{i}/"} for i in range(total)]
+        self.mode = mode
+        self.calls = []
+
+    def list_items(self, folder_ids=None, limit=200, offset=0):
+        self.calls.append(offset)
+        start = offset * limit if self.mode == "page" else offset
+        return self.items[start:start + limit]
+
+
+def _drain(fake, page=200):
+    from igsaved.eagle import EagleClient
+
+    client = EagleClient.__new__(EagleClient)
+    client.list_items = fake.list_items
+    return list(EagleClient.iter_items(client, None, page=page))
+
+
+def test_library_walk_reaches_past_the_first_page():
+    """Симптом: «пише, що все описано, але описано не все». Кожен прохід бачив
+    рівно 200 елементів: offset=200 у збірці з посторінковим offset означає
+    «сторінка 200», тобто порожньо — і бібліотека закінчувалась на першій
+    сторінці."""
+    by_page = _drain(_PagedEagle(450, "page"))
+    assert [item["id"] for item in by_page] == [f"I{i}" for i in range(450)]
+
+    by_items = _drain(_PagedEagle(450, "items"))
+    assert [item["id"] for item in by_items] == [f"I{i}" for i in range(450)]
+
+
+def test_library_walk_stops_on_a_short_page():
+    fake = _PagedEagle(120, "page")
+    assert len(_drain(fake)) == 120
+    assert fake.calls == [0]              # другої сторінки не питаємо
+
+
+def test_library_walk_never_repeats_an_item():
+    """Калібрувальний запит бачить сторінку двічі — елемент має приїхати раз."""
+    fake = _PagedEagle(400, "items")
+    items = _drain(fake)
+    ids = [item["id"] for item in items]
+    assert len(ids) == len(set(ids)) == 400

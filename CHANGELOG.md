@@ -4,6 +4,18 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.4
+
+- **Fixed: the app only ever saw the first 200 items of the Eagle library.**
+  "Everything already has a description" was true — of the first page. Eagle's
+  `offset` means a page number in some builds and an item offset in others;
+  InstRef asked for `offset=200`, which in the page-number build means "page
+  200", i.e. nothing, so every walk of the library ended after 200 items. The
+  walk now calibrates on its second request and keeps whichever meaning returns
+  new items, de-duplicating by item id. This affected everything that reads the
+  library: describing old items, the duplicate check before import, and the
+  cleanup of local copies.
+
 ## 2.5.3
 
 - **A failed cleanup no longer fails the work that succeeded.** Unloading the

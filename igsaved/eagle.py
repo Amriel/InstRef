@@ -180,21 +180,67 @@ class EagleClient:
 
     def iter_items(self, folder_ids: Optional[List[str]] = None,
                    page: int = 200, max_items: int = 100000):
-        """Проходить бібліотеку сторінками — їх бувають тисячі."""
-        offset = 0
-        seen = 0
-        while seen < max_items:
-            chunk = self.list_items(folder_ids, page, offset)
+        """Проходить бібліотеку сторінками — їх бувають тисячі.
+
+        `offset` у Eagle означає різне в різних збірках: десь це номер
+        СТОРІНКИ, десь — зсув у ЕЛЕМЕНТАХ. Застосунок роками бачив рівно 200
+        елементів і звітував «усе вже описано», бо просив offset=200 там, де
+        це означало «сторінка 200», тобто порожньо. Тому другий запит —
+        калібрувальний: пробуємо обидва значення й лишаємось на тому, що дає
+        нові елементи. Плюс усе проходить через множину id: перекриття
+        сторінок не має давати той самий елемент двічі.
+        """
+        seen_ids: set = set()
+        yielded = 0
+
+        def fresh(chunk):
+            for item in chunk or []:
+                key = str(item.get("id") or "")
+                if key and key in seen_ids:
+                    continue
+                if key:
+                    seen_ids.add(key)
+                yield item
+
+        first = self.list_items(folder_ids, page, 0)
+        for item in fresh(first):
+            yield item
+            yielded += 1
+            if yielded >= max_items:
+                return
+        if len(first) < page:
+            return
+
+        mode = None                      # "page" | "items"
+        index = 1
+        while yielded < max_items:
+            if mode is None:
+                # Калібрування: що з двох значень offset дає нову сторінку.
+                for candidate, value in (("page", 1), ("items", page)):
+                    chunk = self.list_items(folder_ids, page, value)
+                    batch = list(fresh(chunk))
+                    if batch:
+                        mode = candidate
+                        break
+                else:
+                    return               # обидва варіанти порожні — кінець
+            else:
+                value = index if mode == "page" else index * page
+                chunk = self.list_items(folder_ids, page, value)
+                batch = list(fresh(chunk))
             if not chunk:
                 return
-            for item in chunk:
+            for item in batch:
                 yield item
-                seen += 1
-                if seen >= max_items:
+                yielded += 1
+                if yielded >= max_items:
                     return
             if len(chunk) < page:
                 return
-            offset += page
+            if not batch:
+                # Сторінка прийшла, але вся вже бачена: далі буде те саме.
+                return
+            index += 1
 
     def get_item(self, item_id: str) -> Optional[dict]:
         """Один елемент за id — коли id відомий, повний список не потрібен."""
