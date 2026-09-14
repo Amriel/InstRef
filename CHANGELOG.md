@@ -4,6 +4,22 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.5.3
+
+- **A failed cleanup no longer fails the work that succeeded.** Unloading the
+  model is a tidying step; when it raised, the whole "describe the library" run
+  reported as failed even though the descriptions were already in Eagle. It is
+  now caught broadly and reported as "the model stayed in memory", nothing more.
+- **Long steps say what they are doing.** Describing one library item means
+  pulling dozens of frames and a request that can take minutes, and the log said
+  nothing the whole time — it looked frozen. Each item now logs when frames are
+  being pulled and when the model is asked.
+- **Running from source: a warning when the files on disk change under a live
+  app.** Python reads a module once, at import, so replacing files while InstRef
+  is open leaves half the app old and half new (lazily imported parts arrive
+  new) — which produces errors that exist in neither version. Starting a sync or
+  a library description now checks and says to restart.
+
 ## 2.5.2
 
 - **The model no longer stays loaded in LM Studio after a run.** LM Studio keeps

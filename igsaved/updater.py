@@ -242,5 +242,28 @@ def update(latest: dict, progress: Progress = lambda *a: None) -> str:
     return update_from_source(latest, progress)
 
 
+def source_stamp(root: Optional[Path] = None) -> float:
+    """Час найсвіжішого .py у пакеті. 0.0 — зібрана версія (файли всередині .exe).
+
+    Python читає модуль один раз, при імпорті. Якщо код на диску замінили, поки
+    застосунок працює, у памʼяті лишається старий — а модулі, які імпортуються
+    ліниво (обслуговування, оновлення), приїдуть уже новими. Суміш двох версій
+    дає помилки на кшталт «object has no attribute», яких немає в жодній із них.
+    """
+    if FROZEN:
+        return 0.0
+    base = Path(root or Path(__file__).resolve().parent)
+    newest = 0.0
+    try:
+        for path in base.rglob("*.py"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return newest
+
+
 def mode_label() -> str:
     return "встановлений застосунок (інсталятор)" if FROZEN else "запуск із вихідників"

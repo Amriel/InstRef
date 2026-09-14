@@ -90,6 +90,12 @@ class MainWindow(PagesMixin, QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
 
         self._quitting = False
+        # Зліпок часу коду: якщо файли оновляться, поки вікно відкрите,
+        # у памʼяті лишиться старий модуль, а ліниві імпорти приїдуть новими.
+        from ..updater import source_stamp
+
+        self._code_stamp = source_stamp()
+        self._code_warned = False
         self._build()
         self._build_tray()
         self._load_config_into_ui()
@@ -218,6 +224,27 @@ class MainWindow(PagesMixin, QMainWindow):
             self._check_health()
         if index == PAGE_MAINTENANCE:
             self.refresh_extras()
+
+    def _warn_if_code_changed(self) -> bool:
+        """Каже, якщо код на диску новіший за той, що працює в памʼяті.
+
+        Симптом, який це охороняє: після заміни файлів «на живу» дозапис описів
+        упав із «'VisionClient' object has no attribute 'unload'» — половина
+        застосунку була старою, половина новою.
+        """
+        from ..updater import source_stamp
+
+        if self._code_warned or not self._code_stamp:
+            return False
+        if source_stamp() <= self._code_stamp + 1:
+            return False
+        self._code_warned = True
+        self._log("⚠ Файли застосунку на диску новіші за запущену версію. "
+                  "Перезапусти InstRef — інакше працює суміш старого й нового коду.")
+        self._show_banner("Застосунок оновився на диску",
+                          "Перезапусти InstRef, щоб працювала одна версія коду.",
+                          "")
+        return True
 
     def _open_extras(self) -> None:
         self._go(PAGE_MAINTENANCE, 1)
@@ -1327,6 +1354,7 @@ class MainWindow(PagesMixin, QMainWindow):
         раніше — і після чистки папки завантажень файли лишились тільки в Eagle.
         Тому й читаємо їх звідти.
         """
+        self._warn_if_code_changed()
         if self.describe_worker and self.describe_worker.isRunning():
             self.describe_worker.stop()
             self._log("Зупиняю опис бібліотеки…")
@@ -1793,6 +1821,7 @@ class MainWindow(PagesMixin, QMainWindow):
 
     # ------------------------------------------------------ синхронізація
     def on_start(self) -> None:
+        self._warn_if_code_changed()
         if not self._require_session():
             return
         if not self.collections:

@@ -465,7 +465,9 @@ class SyncEngine:
             return
         try:
             model = client.unload()
-        except vision.VisionError as exc:
+        except Exception as exc:  # noqa: BLE001
+            # Широко свідомо: невдале прибирання не має псувати прохід, який
+            # уже відпрацював. Але мовчати теж не можна — памʼять не звільнена.
             self.log(f"Модель лишилась у памʼяті: {exc}")
             return
         if model:

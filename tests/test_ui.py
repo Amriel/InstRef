@@ -308,3 +308,18 @@ def test_memory_row_controls_unloading(window):
     assert window.ck_vision_unload.isChecked()
     assert window.sp_vision_ttl.value() == 900
     assert window.btn_vision_unload.isEnabled()
+
+
+def test_stale_code_warning_appears_once(window, monkeypatch, tmp_path):
+    """Після заміни файлів «на живу» половина застосунку стара, половина нова."""
+    import igsaved.updater as updater
+
+    window._code_stamp = 1000.0
+    window._code_warned = False
+    monkeypatch.setattr(updater, "source_stamp", lambda *a, **k: 1000.0)
+    assert window._warn_if_code_changed() is False
+
+    monkeypatch.setattr(updater, "source_stamp", lambda *a, **k: 9999.0)
+    assert window._warn_if_code_changed() is True
+    assert window.banner.isVisibleTo(window)
+    assert window._warn_if_code_changed() is False      # вдруге не набридаємо

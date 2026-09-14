@@ -4178,3 +4178,43 @@ def test_run_unloads_the_model_even_after_an_error(tmp_path):
         assert any("лишилась у памʼяті" in line for line in lines)
     finally:
         state.close()
+
+
+# ==========================================================================
+#  Прибирання не має валити роботу, яка вже вдалась
+# ==========================================================================
+def test_failed_unload_does_not_fail_the_run(tmp_path):
+    """Симптом: «дозапис описів не вдався: 'VisionClient' object has no
+    attribute 'unload'» — описи вже лежали в Eagle, а крок відзвітував як
+    невдалий. Витік був у вузькому except: ловився лише VisionError."""
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        lines = []
+        engine.log = lines.append
+
+        class Stale:                       # модуль зі старої версії в памʼяті
+            pass
+
+        engine._vision = Stale()
+        engine._unload_vision()            # не має кинути
+        assert any("лишилась у памʼяті" in line for line in lines)
+    finally:
+        state.close()
+
+
+def test_source_stamp_notices_replaced_files(tmp_path):
+    """Файли підмінили, поки застосунок працює: у памʼяті старий модуль, а
+    ліниві імпорти приїдуть новими — і виходить суміш двох версій."""
+    from igsaved.updater import source_stamp
+
+    pkg = tmp_path / "igsaved"
+    (pkg / "ui").mkdir(parents=True)
+    (pkg / "vision.py").write_text("x", encoding="utf-8")
+    (pkg / "ui" / "pages.py").write_text("y", encoding="utf-8")
+    before = source_stamp(pkg)
+    assert before > 0
+
+    import os
+    newer = before + 120
+    os.utime(pkg / "ui" / "pages.py", (newer, newer))
+    assert source_stamp(pkg) > before

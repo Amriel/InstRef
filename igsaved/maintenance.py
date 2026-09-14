@@ -655,6 +655,7 @@ def describe_library(
             continue
 
         want = base
+        log(f"   … {(name or Path(path).stem)[:44]}: дістаю кадри")
         if Path(path).suffix.lower() in framegrab.VIDEO_EXT:
             if per > 0:
                 want = framegrab.frame_budget(framegrab.video_duration(Path(path)),
@@ -674,6 +675,9 @@ def describe_library(
 
         name = name or Path(path).stem
         mode = taxonomy.mode_for(path)
+        # Один елемент — це десятки кадрів і запит до моделі на хвилини. Без
+        # цього рядка журнал мовчить увесь цей час, і виглядає як зависання.
+        log(f"   … {name[:44]}: {len(shots)} кадр(ів), питаю модель…")
         answer = client.classify(shots, caption=_strip_description(annotation)[:400],
                                  kind="reel" if mode == taxonomy.VIDEO else "photo",
                                  mode=mode,
@@ -730,11 +734,15 @@ def describe_library(
 
     if getattr(cfg, "vision_unload_after_run", True):
         # Кілька гігабайт VRAM не мають висіти після того, як опис закінчено.
+        # Except широкий свідомо: прибирання за собою НЕ має провалювати роботу,
+        # яка вже вдалась. Одного разу застарілий у памʼяті модуль не мав методу
+        # unload — і весь дозапис описів відзвітував як невдалий, хоча описи
+        # вже лежали в Eagle.
         try:
             unloaded = client.unload()
             if unloaded:
                 log(f"Модель «{unloaded}» вивантажено з LM Studio.")
-        except vision.VisionError as exc:
+        except Exception as exc:  # noqa: BLE001
             log(f"Модель лишилась у памʼяті: {exc}")
     log(f"Готово: {stats.summary()}")
     return stats
