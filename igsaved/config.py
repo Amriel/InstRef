@@ -96,6 +96,10 @@ LEGACY_VISION_TIMEOUT = 60
 # Паузи, що були типовими до попередження Instagram про автоматизацію.
 LEGACY_DELAYS = (2.0, 5.0)
 LEGACY_DOWNLOAD_DELAY = 0.4
+# Межі політики кадрів. Дублюють vision.MAX_FRAMES, щоб config не імпортував
+# vision (той тягне requests і словник тегів).
+MAX_VISION_FRAMES = 32
+MIN_FRAME_SIDE, MAX_FRAME_SIDE = 512, 1536
 TEMPLATE_TOKENS = {
     "{title}": "початок підпису без хештегів і емодзі (якщо тексту нема — код поста)",
     "{user}": "автор без @",
@@ -238,12 +242,15 @@ class Config:
     vision_skip_categories: List[str] = field(
         default_factory=lambda: ["meme", "game"]
     )
-    # Скільки кадрів дістати з ролика. 1 = стара поведінка (тільки обкладинка),
-    # а обкладинка reels — це часто чорний кадр або титр, за яким про ролик
-    # нічого не скажеш.
-    vision_frames: int = 6
-    # Кадрів від тривалості: приблизно один на стільки секунд, але не менше
-    # vision_frames і не більше стелі. 0 = завжди рівно vision_frames.
+    # СТЕЛЯ кадрів на ролик (1–32): скільки взяти, вирішує тривалість (4 / 8 /
+    # 12 / 20 / 32), але не більше цього числа. Кадри великі (896 px), тож і 32
+    # з них модель читає без деградації — а довгий ролик описується весь.
+    vision_frames: int = 32
+    # Довша сторона кадру в пікселях (512–1536). Саме розмір, а не кількість,
+    # дає моделі прочитати бренд чи текст на екрані.
+    vision_frame_side: int = 896
+    # Лишилось у конфізі для сумісності, але на кількість кадрів більше не
+    # впливає: план за тривалістю фіксований (див. describe.plan_frames).
     vision_seconds_per_frame: float = 5.0
     # Брати кадри за монтажними склейками (і минати чорні), а не рівними
     # кроками: рівний крок у ролику з жорстким монтажем влучає в переходи.
@@ -270,6 +277,12 @@ class Config:
     # порожній рядок, щоб оновлення застосунку могло покращити типову
     # інструкцію тим, хто її не редагував.
     vision_prompt: str = ""
+    # Два запити на файл: спершу опис і основа поста (medium), потім теги лише зі
+    # списків словника, що стосуються цього поста (профілі). Один великий
+    # словник на 4B-модель закінчувався загальними словами; False = як раніше,
+    # одним запитом і з усім словником. Власна `vision_prompt` замінює лише
+    # перший запит.
+    vision_two_pass: bool = True
     # Показувати моделі КОЖЕН новий пост заради опису й тегів. Збережене
     # модель не судить — лише описує, і воно одразу йде в Eagle.
     vision_describe_downloads: bool = True
@@ -285,6 +298,12 @@ class Config:
 
     # --- сесія ---
     browser: str = "auto"
+
+    def __post_init__(self) -> None:
+        # Не поле dataclass (тож не потрапляє ні в config.json, ні в підрахунок
+        # полів): тут _migrate лишає людські пояснення, що саме він змінив, а
+        # двигун показує їх у журналі один раз.
+        self.migration_notes: List[str] = []
 
     # ------------------------------------------------------------------ IO
     @classmethod
@@ -321,6 +340,26 @@ class Config:
             self.page_delay_min, self.page_delay_max = 8.0, 15.0
         if abs(float(self.download_delay) - LEGACY_DOWNLOAD_DELAY) < 1e-9:
             self.download_delay = 1.0
+        # Політика кадрів: vision_frames — лише стеля, кількість вирішує
+        # тривалість. Значення понад межу (рукописний конфіг) вкладаємо в неї.
+        try:
+            frames = int(self.vision_frames)
+        except (TypeError, ValueError):
+            frames = MAX_VISION_FRAMES
+        if frames > MAX_VISION_FRAMES:
+            self.migration_notes.append(
+                f"Налаштування кадрів зменшено з {frames} до {MAX_VISION_FRAMES}: "
+                "це стеля, кількість вирішує тривалість ролика.")
+            self.vision_frames = MAX_VISION_FRAMES
+        try:
+            side = int(self.vision_frame_side)
+        except (TypeError, ValueError):
+            side = 0
+        if not MIN_FRAME_SIDE <= side <= MAX_FRAME_SIDE:
+            self.migration_notes.append(
+                f"Сторону кадру {self.vision_frame_side} px повернуто до 896: "
+                f"припустимо {MIN_FRAME_SIDE}–{MAX_FRAME_SIDE}.")
+            self.vision_frame_side = 896
 
     def save(self, path: Path | None = None) -> None:
         path = path or CONFIG_PATH

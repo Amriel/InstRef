@@ -22,6 +22,7 @@ COMMENT_LIMIT = 2000
 # Заголовок нашої частини нотатки. Англійський, бо й опис тепер англійський,
 # і за ним же впізнаємо вже описане при повторному проході.
 SUMMARY_LABEL = "Visual summary:"
+SHORT_LABEL = "In short:"
 SCREEN_LABEL = "On screen:"
 TRANSCRIPT_LABEL = "Voice-over:"
 
@@ -41,6 +42,7 @@ class MediaTags:
     hashtags: List[str] = field(default_factory=list)
     # Те, що написала візуальна модель, подивившись кадри.
     description: str = ""
+    summary: str = ""           # одне речення; іде в коментар першим
     ai_tags: List[str] = field(default_factory=list)
 
     # ------------------------------------------------------------- готові рядки
@@ -52,7 +54,7 @@ class MediaTags:
     def year(self) -> str:
         return self.taken_at.strftime("%Y-%m-%d") if self.taken_at else ""
 
-    def summary(self) -> str:
+    def brief(self) -> str:
         """Короткий опис для полів, куди довгий коментар не влізе."""
         text = " ".join((self.description or "").split())
         if not text:
@@ -65,6 +67,9 @@ class MediaTags:
         head = self.caption.strip()[:COMMENT_LIMIT]
         if head:
             blocks.append(head)
+        short = " ".join((self.summary or "").split())
+        if short:
+            blocks.append(f"{SHORT_LABEL} {short}")
         description = " ".join((self.description or "").split())
         if description:
             # Свідомо після підпису: підпис — слова автора, опис — наші.
@@ -90,13 +95,17 @@ class MediaTags:
 
 
 def annotation(caption: str, description: str = "", screen_text: str = "",
-               transcript: str = "") -> str:
+               transcript: str = "", summary: str = "") -> str:
     """Текст нотатки для Eagle: підпис автора плюс те, що побачила модель.
 
     Текст з екрана — окремим рядком: у туторіалах саме там назви плагінів і
     кроки, і саме за ними потім шукають.
     """
     blocks = [text for text in ((caption or "").strip(),) if text]
+    # Підсумок — першим після підпису: це те, що читають у списку Eagle.
+    short = " ".join((summary or "").split())
+    if short:
+        blocks.append(f"{SHORT_LABEL} {short}")
     description = " ".join((description or "").split())
     if description:
         blocks.append(f"{SUMMARY_LABEL} {description}")
@@ -140,7 +149,7 @@ def _tag_video(path: Path, tags: MediaTags) -> tuple[bool, str]:
         put("\xa9ART", tags.artist)             # Виконавець / автор
         put("aART", tags.author_full or tags.artist)
         put("\xa9cmt", tags.comment())          # Коментар
-        put("desc", tags.summary())             # Короткий опис
+        put("desc", tags.brief())             # Короткий опис
         put("ldes", tags.comment())             # Довгий опис
         put("\xa9day", tags.year)
         put("\xa9gen", f"Instagram {tags.kind}".strip())
@@ -191,7 +200,7 @@ def _tag_jpeg(path: Path, tags: MediaTags) -> tuple[bool, str]:
             zeroth[piexif.ImageIFD.XPAuthor] = _utf16(tags.artist)
         if tags.title:
             zeroth[piexif.ImageIFD.XPTitle] = _utf16(tags.title)
-        subject = tags.summary()
+        subject = tags.brief()
         if subject:
             zeroth[piexif.ImageIFD.XPSubject] = _utf16(subject)
         keywords = tags.keywords()

@@ -4,8 +4,8 @@
 Судити за ним про весь ролик — головне джерело помилок класифікації, тому
 беремо кілька кадрів, рівномірно розкиданих по тривалості.
 
-Кадри стискаються до розумного розміру: моделі не потрібен 4K, а кожен зайвий
-піксель — це токени й час.
+Кадри стискаються до заданої довшої сторони (див. describe.plan_frames): моделі
+не потрібен 4K, а кожен зайвий піксель — це токени й час.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-MAX_SIDE = 640          # довша сторона кадру; більше моделі не дає користі
+MAX_SIDE = 640          # типова довша сторона там, де її не задано (прев'ю, відбитки)
 JPEG_QUALITY = 80
 VIDEO_EXT = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
 
@@ -24,23 +24,6 @@ DARK_LIMIT = 14
 # і мало, щоб не декодувати весь ролик у повний розмір.
 SCENE_SAMPLES = 240
 SCENE_SIDE = 96
-
-
-def frame_budget(duration: float, base: int, ceiling: int,
-                 seconds_per_frame: float = 5.0) -> int:
-    """Скільки кадрів брати з ролика такої тривалості.
-
-    Одна й та сама кількість для 10-секундного reel і трихвилинного туторіалу
-    не має сенсу: перший вона перевантажує, другий — не показує. Тому
-    приблизно один кадр на seconds_per_frame, але не менше базового і не
-    більше стелі.
-    """
-    base = max(1, int(base or 1))
-    ceiling = max(base, int(ceiling or base))
-    if not duration or duration <= 0 or seconds_per_frame <= 0:
-        return base
-    wanted = int(round(duration / seconds_per_frame))
-    return max(base, min(ceiling, wanted))
 
 
 def video_duration(path: Path) -> float:
@@ -71,23 +54,6 @@ def available() -> bool:
     except ImportError:
         return False
     return True
-
-
-def side_for(count: int) -> int:
-    """Розмір кадру під їхню кількість.
-
-    Шістдесят кадрів по 640 px — це кілька мегабайтів base64 в одному запиті
-    й десятки тисяч токенів контексту. Коли кадрів багато, важлива не різкість
-    кожного, а те, що видно весь ролик, — тож зменшуємо сторону.
-    """
-    count = max(1, int(count or 1))
-    if count <= 12:
-        return MAX_SIDE
-    if count <= 24:
-        return 512
-    if count <= 40:
-        return 448
-    return 384
 
 
 def even_positions(total: int, count: int, skip_edges: bool = True) -> List[int]:
@@ -211,7 +177,7 @@ def extract(path: Path, count: int = 6, skip_edges: bool = True,
     path = Path(path)
     if count <= 0 or not path.exists() or path.suffix.lower() not in VIDEO_EXT:
         return []
-    side = max_side or side_for(count)
+    side = max_side or MAX_SIDE
     try:
         import cv2
     except ImportError:
@@ -276,7 +242,7 @@ def _encode(cv2, frame, max_side: int = MAX_SIDE) -> Optional[bytes]:
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 
-def shots_from_file(path: Path, count: int = 6) -> List[bytes]:
+def shots_from_file(path: Path, count: int = 6, side: int = 0) -> List[bytes]:
     """Кадри з будь-якого файлу: з відео — кілька, з картинки — вона сама.
 
     Свідомо перевіряє тип: раніше відео, з якого не вдалось дістати кадри,
@@ -286,11 +252,11 @@ def shots_from_file(path: Path, count: int = 6) -> List[bytes]:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix in VIDEO_EXT:
-        return extract(path, count)
+        return extract(path, count, max_side=side)
     if suffix not in IMAGE_EXT:
         return []
     try:
-        return [shrink_image(path.read_bytes(), side_for(count))]
+        return [shrink_image(path.read_bytes(), side or MAX_SIDE)]
     except OSError:
         return []
 

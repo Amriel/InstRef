@@ -80,7 +80,7 @@ def _seed_review(state: State, root: Path):
             state.add_file(path, pk, "photo", 0, 1)
         state.add_review(pk, path, "", user, "підпис", f"https://ig/{pk}", "причина",
                          verdict, source=src)
-    state.set_ai_meta("1", "art", 0.9, "A chrome sculpture.", ["cgi", "autotagged"], "m", 1)
+    state.set_ai_meta("1", "art", 0.9, "A chrome sculpture.", ["cgi", "autotagged"], "m", 1, summary="Chrome sculpture study.")
     return keep, drop
 
 
@@ -102,7 +102,7 @@ def test_window_builds_with_all_pages(window):
     window._open_session_tab()
     assert window.stack.widget(mw.PAGE_ACCOUNT).subtabs.currentIndex() == 0
     for widget in (window.sp_jitter, window.sp_attempts, window.sp_rate_cooldown,
-                   window.sp_sec_per_frame, window.ck_by_scene, window.sp_backlog,
+                   window.sp_vision_side, window.ck_by_scene, window.sp_backlog,
                    window.cb_dupe, window.btn_normalize, window.btn_vocab,
                    window.btn_given_up, window.btn_urls, window.ind_session):
         assert widget is not None
@@ -110,15 +110,44 @@ def test_window_builds_with_all_pages(window):
 
 def test_settings_round_trip(window):
     window.sp_jitter.setValue(7)
-    window.sp_sec_per_frame.setValue(3)
+    window.sp_vision_frames.setValue(6)
+    window.sp_vision_side.setValue(1024)
     window.ck_by_scene.setChecked(False)
     window.cb_dupe.setCurrentIndex(window.cb_dupe.findData("skip"))
     window._collect_ui_into_config()
     cfg = window.cfg
-    assert (cfg.schedule_jitter_minutes, cfg.vision_seconds_per_frame,
-            cfg.vision_frames_by_scene, cfg.dupe_action) == (7, 3.0, False, "skip")
+    assert (cfg.schedule_jitter_minutes, cfg.vision_frames, cfg.vision_frame_side,
+            cfg.vision_frames_by_scene, cfg.dupe_action) == (7, 6, 1024, False, "skip")
     window._load_config_into_ui()
     assert window.sp_jitter.value() == 7
+    assert window.sp_vision_side.value() == 1024
+
+
+def test_frames_page_estimates_tokens_and_warns(window):
+    """Сторінка «Кадри» має чесно казати, скільки контексту з'їдять кадри.
+
+    Спінбокс стелі — 1–32, сторона — 512–1536 із кроком 128; оцінка береться з
+    тієї самої формули, що й plan_frames.
+    """
+    from igsaved.describe import tokens_per_frame
+
+    assert (window.sp_vision_frames.minimum(), window.sp_vision_frames.maximum()) == (1, 32)
+    assert (window.sp_vision_side.minimum(), window.sp_vision_side.maximum()) == (512, 1536)
+    assert window.sp_vision_side.singleStep() == 128
+
+    window.sp_vision_frames.setValue(8)
+    window.sp_vision_side.setValue(896)
+    text = window.lbl_frames.text()
+    assert f"≈ {tokens_per_frame(896)} токенів на кадр" in text
+    assert f"до {8 * tokens_per_frame(896)} на ролик" in text
+    assert window.lbl_frames.property("role") == "ok"
+
+    # 32 × 896 ≈ 14000 — ще в межах; 32 × 1536 ≈ 41000 — попередження.
+    window.sp_vision_frames.setValue(32)
+    window.sp_vision_side.setValue(896)
+    assert window.lbl_frames.property("role") == "ok"
+    window.sp_vision_side.setValue(1536)
+    assert window.lbl_frames.property("role") == "warn"
 
 
 def test_review_cards_show_editable_description_and_tags(window, tmp_path):
@@ -130,6 +159,10 @@ def test_review_cards_show_editable_description_and_tags(window, tmp_path):
     assert tab._cards[0].media_pk == "2"                     # відсіяне — першим
     card = cards["1"]
     assert card.ed_description.toPlainText() == "A chrome sculpture."
+    # підсумок — лише для читання, над описом; без нього рядок схований
+    assert card.lbl_summary.text() == "Chrome sculpture study."
+    assert not card.lbl_summary.isHidden()
+    assert cards["3"].lbl_summary.isHidden()
     assert card.ed_tags.text() == "cgi"
 
     # правка перед «Залишити» потрапляє в базу — звідти її візьме Eagle
@@ -333,3 +366,13 @@ def test_whole_library_describe_is_a_setting(window):
     window.cfg.describe_whole_library = False
     window._load_config_into_ui()
     assert not window.ck_describe_whole.isChecked()
+
+
+def test_two_pass_tagging_is_a_setting(window):
+    """Теги окремим запитом за профілем — налаштування, не прихована поведінка."""
+    window.ck_two_pass.setChecked(False)
+    window._collect_ui_into_config()
+    assert window.cfg.vision_two_pass is False
+    window.cfg.vision_two_pass = True
+    window._load_config_into_ui()
+    assert window.ck_two_pass.isChecked()

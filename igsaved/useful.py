@@ -105,3 +105,91 @@ def useful_tags(*texts: str) -> List[str]:
     if CONTENT_TAGS.intersection(found):
         found.append(MARKER)
     return found
+
+
+# ----------------------------------------------------------------- програми
+# Назву програми модель із кадру не вгадує («Never guess software brands»), але
+# вона часто є в підписі, в тексті на екрані й у хештегах. Тож тег ставить код:
+# він шукає ЦІЛІ слова (не підрядки: «art» у «gamestart» уже був багом).
+SOFTWARE_TAGS = [
+    "blender", "houdini", "cinema-4d", "maya", "3ds-max", "unreal-engine", "unity",
+    "after-effects", "nuke", "davinci-resolve", "premiere", "redshift", "octane",
+    "arnold", "vray", "substance", "zbrush", "marvelous-designer", "touchdesigner",
+    "notch", "embergen", "comfyui", "stable-diffusion", "midjourney", "runway",
+    "kling", "sora", "veo", "flux", "photoshop", "illustrator", "figma",
+]
+
+# Скорочення й альтернативні написання → тег. Спільні з синонімами словника.
+SOFTWARE_ALIASES: Dict[str, str] = {
+    "b3d": "blender", "c4d": "cinema-4d", "cinema4d": "cinema-4d",
+    "ae": "after-effects", "aftereffects": "after-effects",
+    "ue5": "unreal-engine", "ue4": "unreal-engine", "unreal": "unreal-engine",
+    "resolve": "davinci-resolve", "davinci": "davinci-resolve",
+    "sd": "stable-diffusion", "mj": "midjourney", "3dsmax": "3ds-max",
+    "touch-designer": "touchdesigner", "ps": "photoshop",
+}
+# Слова, що без `#` частіше означають щось своє: Unity of design, Runway show,
+# «resolve the issue», Arnold, SD card. Для них потрібен хештег.
+_AMBIGUOUS = frozenset({
+    "ae", "sd", "mj", "ps", "resolve", "unity", "runway", "flux", "notch", "arnold",
+    "maya", "octane", "substance", "nuke", "davinci",
+})
+# Багатослівні й розбиті форми, яких не дає ні тег, ні alias.
+_EXTRA_PHRASES = {
+    ("v", "ray"): "vray", ("octane", "render"): "octane",
+    ("touch", "designer"): "touchdesigner", ("substance", "painter"): "substance",
+    ("substance", "designer"): "substance", ("unreal", "engine", "5"): "unreal-engine",
+    ("stable", "diffusion"): "stable-diffusion", ("cinema", "4d"): "cinema-4d",
+    ("marvelous", "designer"): "marvelous-designer", ("3ds", "max"): "3ds-max",
+    ("after", "effects"): "after-effects", ("davinci", "resolve"): "davinci-resolve",
+    ("unreal", "engine"): "unreal-engine", ("premiere", "pro"): "premiere",
+}
+
+
+def _phrase_table() -> Dict[tuple, str]:
+    table: Dict[tuple, str] = {}
+    for tag in SOFTWARE_TAGS:
+        table[tuple(tag.split("-"))] = tag
+        table[(tag.replace("-", ""),)] = tag
+    for alias, tag in SOFTWARE_ALIASES.items():
+        table[tuple(alias.split("-"))] = tag
+        table[(alias.replace("-", ""),)] = tag
+    table.update(_EXTRA_PHRASES)
+    return table
+
+
+_PHRASES = _phrase_table()
+_TOKEN = re.compile(r"(#?)([a-z0-9]+)")
+
+
+def software_tags(caption: str = "", screen_text: str = "", transcript: str = "",
+                  hashtags: Sequence[str] = ()) -> List[str]:
+    """Програми, названі в тексті поста: «Made in Blender + Redshift #c4d».
+
+    Токени, а не підрядки; регістр не важить; `#houdini` теж рахується. Двозначні
+    слова (ae, sd, resolve, unity…) беруться лише з хештегом. Слово «render» тегу
+    програми не дає: це техніка, а не софт. Порядок — за появою в тексті.
+    """
+    blob = " ".join(str(t) for t in (caption, screen_text, transcript) if t)
+    tags_blob = " ".join("#" + str(h).strip().lstrip("#") for h in (hashtags or []) if h)
+    tokens = [(m.group(2), bool(m.group(1)))
+              for m in _TOKEN.finditer((blob + " " + tags_blob).lower())]
+    found: List[str] = []
+    index = 0
+    while index < len(tokens):
+        for size in (3, 2, 1):
+            chunk = tokens[index:index + size]
+            if len(chunk) < size:
+                continue
+            tag = _PHRASES.get(tuple(word for word, _ in chunk))
+            if not tag:
+                continue
+            first_word, hashed = chunk[0]
+            if size == 1 and first_word in _AMBIGUOUS and not hashed:
+                continue
+            if tag not in found:
+                found.append(tag)
+            index += size - 1
+            break
+        index += 1
+    return found

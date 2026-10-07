@@ -1730,7 +1730,12 @@ def test_vision_prompt_placeholders_and_broken_edits():
     assert "6 frame(s)" in text and "reel" in text
     assert "{frames}" not in text
     # порожньо в конфізі = вбудована інструкція
-    assert build_prompt("   ", 1, "photo") == build_prompt(DEFAULT_PROMPT, 1, "photo")
+    from igsaved.vision import SINGLE_PASS_PROMPT
+
+    assert build_prompt("   ", 1, "photo") == build_prompt(SINGLE_PASS_PROMPT, 1, "photo")
+    # а двокроковий режим просить інструкцію без тегів
+    assert build_prompt("   ", 1, "photo", default=DEFAULT_PROMPT) == \
+        build_prompt(DEFAULT_PROMPT, 1, "photo")
     # своя інструкція із зайвою дужкою не має нічого валити
     assert build_prompt("дивись {frames} кадрів {oops}", 3, "video") == \
         "дивись 3 кадрів {oops}"
@@ -1753,21 +1758,6 @@ def test_vision_client_sends_every_frame():
         assert len(images) == 3
         text = next(part for part in content if part["type"] == "text")["text"]
         assert "3 frame(s)" in text and "reel" in text
-    finally:
-        server.shutdown()
-
-
-def test_vision_client_caps_the_number_of_frames():
-    from igsaved.vision import MAX_FRAMES, VisionClient
-
-    _LMStudioHandler.seen.clear()
-    server = HTTPServer(("127.0.0.1", 0), _LMStudioHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        client = VisionClient(f"http://127.0.0.1:{server.server_port}/v1")
-        client.classify([b"\xff\xd8x"] * (MAX_FRAMES + 8))
-        content = _LMStudioHandler.seen[0]["messages"][0]["content"]
-        assert len([p for p in content if p["type"] == "image_url"]) == MAX_FRAMES
     finally:
         server.shutdown()
 
@@ -1827,7 +1817,7 @@ def test_media_tags_carry_the_model_description():
     assert "Visual summary: Камера облітає скляну форму." in comment
     assert "Автор: @studioalt" in comment
     assert comment.index("нове") < comment.index("Visual summary:") < comment.index("Автор:")
-    assert tags.summary() == "Камера облітає скляну форму."
+    assert tags.brief() == "Камера облітає скляну форму."
 
     keywords = tags.keywords()
     assert "3d-render" in keywords and "#glass" in keywords
@@ -1840,7 +1830,7 @@ def test_media_tags_carry_the_model_description():
 def test_summary_falls_back_to_the_title_without_a_description():
     from igsaved.tagging import MediaTags
 
-    assert MediaTags(title="Скло").summary() == "Скло"
+    assert MediaTags(title="Скло").brief() == "Скло"
 
 
 # ==========================================================================
@@ -1920,14 +1910,19 @@ def test_frames_for_falls_back_to_the_cover(tmp_path, monkeypatch):
 
 
 def test_frames_for_reads_the_real_video(tmp_path, monkeypatch):
+    """Ролик на 2,4 с — це 4 кадри за планом тривалості; стеля їх лише обрізає."""
     pytest.importorskip("cv2")
     engine, cfg, state = _engine(tmp_path, vision_frames=5)
     try:
         cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         _make_video(cfg.cache_dir / "111.mp4")
         shots, kind = engine._frames_for(FakeMedia())
-        assert len(shots) == 5 and len(set(shots)) == 5
+        assert len(shots) == 4 and len(set(shots)) == 4
         assert kind == "reel"
+
+        cfg.vision_frames = 3          # стеля нижча за план — береться стеля
+        shots, _ = engine._frames_for(FakeMedia())
+        assert len(shots) == 3
     finally:
         state.close()
 
@@ -2305,69 +2300,6 @@ def test_old_database_gets_the_source_column(tmp_path):
 # ==========================================================================
 #  Багато кадрів: стеля висока, але запит не має розпухати
 # ==========================================================================
-def test_frame_side_shrinks_as_the_count_grows():
-    from igsaved.frames import MAX_SIDE, side_for
-
-    assert side_for(1) == MAX_SIDE
-    assert side_for(12) == MAX_SIDE
-    # 60 кадрів по 640 px — це мегабайти base64 в одному запиті
-    assert side_for(24) < MAX_SIDE
-    assert side_for(60) < side_for(24)
-    # менше не буває — інакше модель уже нічого не розбере
-    assert side_for(60) >= 320
-
-
-def test_many_frames_really_are_smaller(tmp_path):
-    from igsaved import frames
-
-    video = _make_video(tmp_path / "clip.mp4", count=200, size=(1280, 720))
-    few = frames.extract(video, 6)
-    many = frames.extract(video, 48)
-    assert len(few) == 6 and len(many) == 48
-
-    cv2 = pytest.importorskip("cv2")
-    import numpy as np
-
-    def longest(data):
-        picture = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        return max(picture.shape[:2])
-
-    assert longest(few[0]) == frames.side_for(6)
-    assert longest(many[0]) == frames.side_for(48)
-    # головне заради чого все: сумарна вага не росте пропорційно кількості
-    assert sum(len(x) for x in many) < sum(len(x) for x in few) * len(many) / len(few)
-
-
-def test_ceiling_allows_sixty_frames():
-    from igsaved.vision import MAX_FRAMES, SAFE_FRAMES, VisionClient
-
-    assert MAX_FRAMES == 60
-    assert SAFE_FRAMES < MAX_FRAMES
-
-    _LMStudioHandler.seen.clear()
-    server = HTTPServer(("127.0.0.1", 0), _LMStudioHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        client = VisionClient(f"http://127.0.0.1:{server.server_port}/v1")
-        client.classify([b"\xff\xd8x"] * 60)
-        content = _LMStudioHandler.seen[0]["messages"][0]["content"]
-        assert len([p for p in content if p["type"] == "image_url"]) == 60
-    finally:
-        server.shutdown()
-
-
-def test_engine_honours_a_high_frame_count(tmp_path):
-    pytest.importorskip("cv2")
-    engine, cfg, state = _engine(tmp_path, vision_frames=40)
-    try:
-        cfg.cache_dir.mkdir(parents=True, exist_ok=True)
-        _make_video(cfg.cache_dir / "111.mp4", count=200)
-        shots, _ = engine._frames_for(FakeMedia())
-        assert len(shots) == 40
-    finally:
-        state.close()
-
-
 # ==========================================================================
 #  Карусель: у кожного слайда свій опис
 # ==========================================================================
@@ -2452,7 +2384,7 @@ def test_video_still_gets_one_description_from_many_frames(tmp_path):
             )[1]
         )
         engine._describe(FakeMedia(), "111", [(video, 0)])
-        assert asked == [5]              # один запит на п'ять кадрів
+        assert asked == [4]              # один запит на всі кадри ролика (2,4 с → 4)
     finally:
         state.close()
 
@@ -2634,6 +2566,7 @@ def test_describe_library_fills_in_the_old_eagle_items(tmp_path, monkeypatch):
         cfg = Config()
         cfg.download_dir = str(tmp_path / "dl")
         cfg.vision_enabled = True
+        cfg.vision_two_pass = False          # цей тест підміняє classify
         cfg.vision_frames = 3
         cfg.eagle_url = f"http://127.0.0.1:{server.server_port}"
         cfg.eagle_root_folder = "Instagram Saved"
@@ -2732,7 +2665,8 @@ def test_taxonomy_keeps_only_words_it_knows():
     kept, dropped = tax.normalize(
         ["Close-Up", "#Golden Hour", "totally-made-up", "cinematic"], mode="video")
 
-    assert "close-up" in kept and "golden-hour" in kept and "cinematic" in kept
+    assert "close-up" in kept and "golden-hour" in kept
+    assert "cinematic" not in kept and "cinematic" not in dropped     # слово-паразит
     assert "totally-made-up" not in kept
     assert dropped == ["totally-made-up"]
     assert kept[-1] == MARKER          # службова позначка завжди остання
@@ -2751,10 +2685,10 @@ def test_taxonomy_maps_near_misses_to_the_right_word():
     from igsaved.taxonomy import Taxonomy
 
     tax = Taxonomy()
-    kept, dropped = tax.normalize(["skiing", "goldfish", "computer"], mode="video")
+    kept, dropped = tax.normalize(["skiing", "goldfish", "sneakers"], mode="video")
     assert "sport-action" in kept
     assert "fish" in kept
-    assert "screen" in kept
+    assert "footwear" in kept
     assert dropped == []
 
 
@@ -2802,8 +2736,9 @@ def test_taxonomy_prompt_lists_differ_by_mode():
     video = tax.render("video")
     image = tax.render("image")
     assert "CAMERA MOVEMENT" in video and "CAMERA MOVEMENT" not in image
-    assert "live-action" in video and "live-action" not in image
-    assert "photograph" in image and "photograph" not in video
+    # PRIMARY MEDIUM тепер одна категорія для обох режимів
+    assert "live-action" in video and "live-action" in image
+    assert "photograph" in image and "photograph" in video
     assert "LIGHTING SOURCE" in video and "LIGHTING SOURCE" in image
 
 
@@ -2824,8 +2759,8 @@ def test_taxonomy_roundtrips_and_grows(tmp_path):
 
     path = tmp_path / "taxonomy.json"
     tax = Taxonomy()
-    assert tax.add("vaporwave", "aesthetic") is True
-    assert tax.add("vaporwave", "aesthetic") is False     # двічі не додається
+    assert tax.add("vaporwave", "mood") is True
+    assert tax.add("vaporwave", "mood") is False          # двічі не додається
     assert tax.add("whatever", "no-such-category") is False
     tax.save(path)
 
@@ -3536,15 +3471,6 @@ def test_frames_follow_scene_cuts_and_skip_black(tmp_path):
     assert colours == [0, 1, 2]            # по одному з кожної сцени, хронологічно
 
 
-def test_frame_budget_scales_with_duration():
-    from igsaved.frames import frame_budget
-
-    assert frame_budget(10, 6, 60) == 6            # короткий reel — не менше базового
-    assert frame_budget(180, 6, 60, 5.0) == 36     # три хвилини — по кадру на 5 с
-    assert frame_budget(3600, 6, 60) == 60         # стеля
-    assert frame_budget(0, 6, 60) == 6             # тривалість невідома
-
-
 def test_dhash_survives_reencoding_and_tells_different_apart(tmp_path):
     cv2 = pytest.importorskip("cv2")
     import numpy as np
@@ -3666,11 +3592,11 @@ def test_normalize_library_fixes_old_tags_in_db_and_eagle(tmp_path):
         assert stats.changed == 1 and stats.eagle_updated == 1
         tags = state.ai_meta("1")["tags"]
         assert "render" not in tags and "vibes" not in tags
-        assert "3d-animation" in tags and "backlit" in tags
+        assert "3d-render" in tags and "backlit" in tags
         update = _FakeEagle.updates[0]
         assert update["id"] == "e1"
         assert "manual-tag" in update["tags"] and "instagram" in update["tags"]
-        assert "render" not in update["tags"] and "3d-animation" in update["tags"]
+        assert "render" not in update["tags"] and "3d-render" in update["tags"]
     finally:
         state.close()
         server.shutdown()
@@ -4269,3 +4195,1114 @@ def test_library_walk_never_repeats_an_item():
     items = _drain(fake)
     ids = [item["id"] for item in items]
     assert len(ids) == len(set(ids)) == 400
+
+
+# ==========================================================================
+#  Єдиний конвеєр опису (igsaved/describe.py): кадри — мало, зате великі
+# ==========================================================================
+def _jpeg(path, size=(60, 80), value=120):
+    """Невеличка справжня картинка: потрібна там, де файл читається з диска."""
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    picture = np.full((size[1], size[0], 3), value, np.uint8)
+    path.write_bytes(cv2.imencode(".jpg", picture)[1].tobytes())
+    return path
+
+
+def test_plan_frames_follow_duration_and_respect_the_ceiling():
+    """Симптом: 28 дрібних кадрів на кожен ролик — модель їх лише перераховувала.
+
+    Кількість тепер визначає тривалість (4 / 8 / 12 / 20 / 32), `vision_frames` —
+    лише стеля, а картинка чи слайд завжди один кадр.
+    """
+    from igsaved.describe import plan_frames
+
+    cfg = Config()
+    cfg.vision_frames = 12
+    assert plan_frames(5, cfg).count == 4
+    assert plan_frames(10, cfg).count == 4
+    assert plan_frames(20, cfg).count == 8
+    assert plan_frames(30, cfg).count == 8
+    assert plan_frames(60, cfg).count == 12
+    assert plan_frames(90, cfg).count == 12                  # 20 обрізано стелею
+    assert plan_frames(0, cfg).count == 12                   # тривалість невідома
+    assert plan_frames(None, cfg).count == 1                 # картинка / слайд
+    assert plan_frames(5, cfg).side == cfg.vision_frame_side == 896
+
+    cfg.vision_frames = 6                                    # стеля нижча за план
+    assert plan_frames(90, cfg).count == 6
+    cfg.vision_frames = 1
+    assert plan_frames(20, cfg).count == 1
+
+    cfg.vision_frame_side = 1024
+    assert plan_frames(20, cfg).side == 1024
+
+
+def test_long_videos_get_twenty_and_thirty_two_frames():
+    """Симптом: опис довгого ролика охоплював лише перші 12 кадрів — решту модель не бачила.
+
+    Тепер ≤120 с → 20 кадрів, довше → 32 (стеля за замовчуванням 32).
+    """
+    from igsaved.describe import plan_frames
+
+    cfg = Config()
+    assert cfg.vision_frames == 32
+    assert plan_frames(61, cfg).count == 20
+    assert plan_frames(120, cfg).count == 20
+    assert plan_frames(121, cfg).count == 32
+    assert plan_frames(900, cfg).count == 32
+    cfg.vision_frames = 16                                   # стеля обрізає
+    assert plan_frames(900, cfg).count == 16
+
+
+def test_default_prompt_asks_to_cover_the_whole_post():
+    """Симптом: опис довгого ролика розповідав лише про початок."""
+    from igsaved.vision import DEFAULT_PROMPT
+
+    assert "cover the WHOLE post in order" in DEFAULT_PROMPT
+
+
+def test_plan_frames_reads_a_real_file_and_shots_follow_the_plan(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from igsaved.describe import FramePlan, plan_frames, shots_for
+
+    cfg = Config()
+    video = _make_video(tmp_path / "clip.mp4", count=60, size=(1280, 720))   # 2,4 с
+    assert plan_frames(video, cfg).count == 4
+    picture = _jpeg(tmp_path / "p.jpg", size=(1500, 1000))
+    assert plan_frames(picture, cfg).count == 1
+
+    def longest(data):
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        return max(frame.shape[:2])
+
+    shots = shots_for(video, FramePlan(3, 640))
+    assert len(shots) == 3 and all(longest(s) == 640 for s in shots)
+    still = shots_for(picture, FramePlan(1, 512))
+    assert len(still) == 1 and longest(still[0]) == 512
+
+
+def test_plan_frames_fit_into_the_loaded_context():
+    """Симптом: модель, завантажена з контекстом 4096, обривала запит із 12 великих кадрів.
+
+    Спершу зменшуємо розмір (кроком 128 до 512), лише потім кількість (до 3), і
+    кажемо про це одним рядком.
+    """
+    from igsaved.describe import PROMPT_OVERHEAD_TOKENS, plan_frames, tokens_per_frame
+
+    cfg = Config()
+    cfg.vision_frames = 12
+
+    plan = plan_frames(90, cfg, context_tokens=4096)
+    assert plan.side == 512 and 3 <= plan.count < 12
+    assert plan.count * tokens_per_frame(512) + PROMPT_OVERHEAD_TOKENS <= 4096
+    assert "4096" in plan.note and f"{plan.count}×512" in plan.note
+
+    # контексту вистачає лише після зменшення розміру — кількість не чіпаємо
+    cfg.vision_frames = 8
+    mid = plan_frames(20, cfg, context_tokens=6500)
+    assert mid.count == 8 and 512 < mid.side < 896 and mid.side % 128 == 0
+    assert mid.note
+
+    # з великим або невідомим контекстом план лишається як просили
+    for ctx in (None, 0, 50176):
+        free = plan_frames(20, cfg, context_tokens=ctx)
+        assert (free.count, free.side, free.note) == (8, 896, "")
+
+    # зовсім малий контекст: нижче 512 px і 3 кадрів не йдемо
+    tiny = plan_frames(90, cfg, context_tokens=1000)
+    assert (tiny.count, tiny.side) == (3, 512)
+
+
+def test_tokens_per_frame_matches_the_qwen_estimate():
+    from igsaved.describe import tokens_per_frame
+
+    assert 430 <= tokens_per_frame(896) <= 450
+    assert tokens_per_frame(512) < tokens_per_frame(896) < tokens_per_frame(1536)
+
+
+def test_prompt_hash_changes_with_the_frame_side():
+    """Політика кадрів — частина відбитка: «лише застарілі» мають бачити різницю."""
+    from igsaved.vision import prompt_hash
+
+    assert prompt_hash("", "m", 896) != prompt_hash("", "m", 1024)
+    assert prompt_hash("", "m", 896) != prompt_hash("", "m")
+    assert prompt_hash("", "m") == prompt_hash("   ", "m", 0)
+
+
+def test_old_frame_settings_are_migrated_with_a_note(tmp_path):
+    """Симптом: у конфізі кадрів більше за межу — стеля має вкластися в 32, а 28 лишається."""
+    from dataclasses import asdict, fields
+
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"vision_frames": 28, "vision_frame_side": 100}),
+                    encoding="utf-8")
+    cfg = Config.load(path)
+    assert cfg.vision_frames == 28                  # у межах — не чіпаємо
+    assert cfg.vision_frame_side == 896
+    assert len(cfg.migration_notes) == 1            # лише сторона кадру
+
+    big = tmp_path / "big.json"
+    big.write_text(json.dumps({"vision_frames": 60}), encoding="utf-8")
+    capped = Config.load(big)
+    assert capped.vision_frames == 32
+    assert any("з 60 до 32" in note for note in capped.migration_notes)
+    # нотатки — не поле конфігу: у файл вони не потрапляють
+    assert "migration_notes" not in asdict(cfg)
+    assert "migration_notes" not in {f.name for f in fields(Config)}
+
+    ok = tmp_path / "ok.json"
+    ok.write_text(json.dumps({"vision_frames": 12, "vision_frame_side": 1536}),
+                  encoding="utf-8")
+    fine = Config.load(ok)
+    assert (fine.vision_frames, fine.vision_frame_side) == (12, 1536)
+    assert fine.migration_notes == []
+
+    # двигун показує нотатки один раз
+    from igsaved.describe import log_migration_notes
+
+    lines = []
+    log_migration_notes(capped, lines.append)
+    log_migration_notes(capped, lines.append)
+    assert len(lines) == 1 and "з 60 до 32" in lines[0]
+
+
+# ---------------------------------------------------- теги з доказом
+def test_tags_with_evidence_are_parsed_and_negative_ones_rejected():
+    """Симптом: модель сама писала в evidence «no visible sneakers», але тег лишався."""
+    from igsaved.vision import parse_answer
+
+    answer = parse_answer(json.dumps({
+        "category": "art", "confidence": 0.9, "description": "Скляна пляшка.",
+        "tags": [
+            {"tag": "glass", "evidence": "glass bottle in frame 2"},
+            {"tag": "Sneaker", "evidence": "No visible sneakers"},
+            {"tag": "urban", "evidence": "unclear background"},
+            {"tag": "macro", "evidence": ""},
+        ],
+    }))
+    assert answer.tags == ["glass", "macro"]
+    assert answer.rejected == ["sneaker", "urban"]
+
+
+def test_plain_string_tags_still_work():
+    """Старі й чужі інструкції віддають теги списком рядків."""
+    from igsaved.vision import parse_answer
+
+    answer = parse_answer('{"category":"art","confidence":0.8,"tags":["glass","Neon Sign"]}')
+    assert answer.tags == ["glass", "neon-sign"]
+    assert answer.rejected == []
+
+
+def test_negative_tags_keep_their_negative_evidence():
+    """Симптом: `faceless-shot` з доказом «no face visible in first frame» відкидався,
+    хоча саме це заперечення і є доказом тегу."""
+    from igsaved.vision import parse_answer
+
+    answer = parse_answer(json.dumps({"category": "art", "confidence": 0.9, "tags": [
+        {"tag": "faceless-shot", "evidence": "no face visible in first frame"},
+        {"tag": "sneaker", "evidence": "no visible sneakers"},
+    ]}))
+    assert answer.tags == ["faceless-shot"]
+    assert answer.rejected == ["sneaker"]
+
+
+def test_evidence_negation_needs_a_whole_word():
+    """«notebook» чи «nose» не заперечення: шукаємо слово, а не підрядок."""
+    from igsaved.vision import parse_answer
+
+    answer = parse_answer(json.dumps({"category": "art", "confidence": 0.9, "tags": [
+        {"tag": "stationery", "evidence": "notebook on the desk"},
+        {"tag": "portrait", "evidence": "nose and eyes in close-up"},
+    ]}))
+    assert answer.tags == ["stationery", "portrait"] and answer.rejected == []
+
+
+def test_default_prompt_asks_for_evidence():
+    from igsaved.vision import DEFAULT_PROMPT
+
+    from igsaved.vision import SINGLE_PASS_PROMPT, TAG_PROMPT
+
+    # правила доказів живуть у тих промптах, що просять теги; опис їх не має
+    for prompt in (SINGLE_PASS_PROMPT, TAG_PROMPT):
+        assert "Aim for 6-14 tags" in prompt
+        assert "A tag you cannot back with evidence must be omitted." in prompt
+        assert '"evidence": "<3-6 words>"' in prompt
+    assert "ALLOWED TAGS" not in DEFAULT_PROMPT and '"tags"' not in DEFAULT_PROMPT
+
+
+# ------------------------------------------------------------ remember()
+def test_remember_never_files_category_names_as_tag_candidates(tmp_path):
+    """Симптом: «ad» мав 197 влучень у звіті словника — це категорія, а не тег."""
+    from igsaved import vision
+    from igsaved.describe import remember
+
+    state = State(tmp_path / "s.db")
+    try:
+        verdict = vision.VisionVerdict(
+            category=vision.ART, confidence=0.9, description="Скло.", tags=["glass"],
+            dropped=["ad", "art", "meme", "game", "other", "sneaker"], frames=4)
+        assert remember(state, "42", 0, verdict, "vlm", "hash1") is True
+        rows = state.db.execute("SELECT tag FROM tag_candidates").fetchall()
+        assert {r["tag"] for r in rows} == {"sneaker"}
+        assert state.ai_meta("42")["prompt_hash"] == "hash1"
+    finally:
+        state.close()
+
+
+def test_remember_does_not_store_an_empty_verdict(tmp_path):
+    """Порожній опис колись виглядав як «вже описано» й блокував повторну спробу."""
+    from igsaved import vision
+    from igsaved.describe import remember
+
+    state = State(tmp_path / "s.db")
+    try:
+        empty = vision.VisionVerdict(category=vision.ART, confidence=0.9,
+                                     dropped=["sneaker"])
+        assert remember(state, "42", 0, empty, "vlm", "h") is False
+        assert state.ai_meta("42") is None and not state.has_ai_meta("42")
+        # відкинуті теги все одно порахувались
+        count = state.db.execute("SELECT COUNT(*) AS c FROM tag_candidates").fetchone()["c"]
+        assert count == 1
+        # лише маркер autotagged — теж не текст
+        marker = vision.VisionVerdict(tags=["autotagged"])
+        assert remember(state, "43", 0, marker, "vlm", "h") is False
+    finally:
+        state.close()
+
+
+def test_rejected_tags_are_logged_in_one_line(tmp_path):
+    from igsaved import vision
+
+    engine, cfg, state = _engine(tmp_path)
+    try:
+        lines = []
+        engine.log = lines.append
+        engine._vision_model = "vlm"
+        verdict = vision.VisionVerdict(
+            category=vision.ART, confidence=0.9, description="Скло.", tags=["glass"],
+            rejected=["sneaker", "urban"], frames=4)
+        engine._save_ai(FakeMedia(), verdict)
+        assert "   ⤬ без доказу: sneaker, urban" in lines
+        assert state.ai_meta("111")["tags"] == ["glass"]
+
+        lines.clear()
+        engine._save_ai(FakeMedia(pk="222"), vision.VisionVerdict(
+            category=vision.ART, confidence=0.9, description="Ще."))
+        assert not any("без доказу" in line for line in lines)
+    finally:
+        state.close()
+
+
+# ------------------------------------ thinking-моделі й тип моделі в LM Studio
+class _ThinkingHandler(_LMStudioHandler):
+    """Фейк, що віддає задане повідомлення моделі замість звичайної відповіді."""
+
+    message: dict = {}
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        self.rfile.read(length)
+        self._send({"choices": [{"message": self.message}]})
+
+
+def _classify_with(message):
+    from igsaved.vision import VisionClient
+
+    _ThinkingHandler.message = message
+    server = HTTPServer(("127.0.0.1", 0), _ThinkingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        return VisionClient(f"http://127.0.0.1:{server.server_port}/v1").classify(
+            [b"\xff\xd8x"])
+    finally:
+        server.shutdown()
+
+
+def test_reasoning_only_answer_explains_the_thinking_problem():
+    """Симптом: thinking-модель віддавала порожній content, а журнал казав
+    «не вдалось розібрати відповідь» — без підказки, що міняти треба модель."""
+    from igsaved.vision import THINKING_ERROR
+
+    verdict = _classify_with({"content": "", "reasoning_content": "Let me think about it…"})
+    assert verdict.error == THINKING_ERROR
+    assert "thinking" in verdict.error and "instruct" in verdict.error
+
+    verdict = _classify_with({"content": None, "reasoning": "hmm"})
+    assert verdict.error == THINKING_ERROR
+
+    only_think = _classify_with({"content": "<think>довго міркую…</think>"})
+    assert only_think.error == THINKING_ERROR
+
+
+def test_think_block_is_cut_and_the_json_after_it_is_parsed():
+    verdict = _classify_with({
+        "content": '<think>категорію скажу art</think>\n'
+                   '{"category": "art", "confidence": 0.8, "description": "Скло."}',
+        "reasoning_content": "тут теж роздуми",
+    })
+    assert verdict.ok and verdict.category == "art" and verdict.description == "Скло."
+
+    # закриваючий тег без відкриваючого (шаблон сам дописав його в промпт)
+    bare = _classify_with({"content": 'роздуми…</think>{"category":"game","confidence":0.7}'})
+    assert bare.ok and bare.category == "game"
+
+
+def test_classify_asks_for_900_tokens_and_scales_the_timeout(monkeypatch):
+    from igsaved.vision import VisionClient
+
+    _LMStudioHandler.seen.clear()
+    server = HTTPServer(("127.0.0.1", 0), _LMStudioHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = VisionClient(f"http://127.0.0.1:{server.server_port}/v1", timeout=100)
+        seen = {}
+        original = client.session.post
+
+        def spy(url, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return original(url, **kwargs)
+
+        monkeypatch.setattr(client.session, "post", spy)
+        client.classify([b"\xff\xd8x"] * 5)
+        assert _LMStudioHandler.seen[0]["max_tokens"] == 1200
+        assert seen["timeout"] == 100 + 2 * 5
+    finally:
+        server.shutdown()
+
+
+class _TypedLMStudio(_LMStudioHandler):
+    """LM Studio з рідним /api/v0/models: типи й контекст моделей."""
+
+    fail_load = False
+    posts: list = []
+
+    def do_GET(self):  # noqa: N802
+        if self.path.endswith("/api/v0/models"):
+            self._send({"data": [
+                {"id": "qwen3-vl-4b-instruct", "type": "llm",       # назва бреше
+                 "loaded_context_length": 4096},
+                {"id": "mystery-model", "type": "vlm"},             # назва мовчить
+                {"id": "nomic-embed", "type": "embeddings"},
+            ]})
+        elif self.path.endswith("/v1/models"):
+            self._send({"data": [{"id": "nomic-embed"}, {"id": "qwen3-vl-4b-instruct"},
+                                 {"id": "mystery-model"}]})
+        else:
+            self._send({"error": "nope"}, 404)
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        self.posts.append(json.loads(self.rfile.read(length) or b"{}"))
+        if self.fail_load:
+            self._send({"error": {"message": "Failed to load model: out of memory"}}, 400)
+        else:
+            self._send({"choices": [{"message": {"content": "ok"}}]})
+
+
+def test_looks_visual_trusts_the_model_type_over_the_name():
+    """Симптом: евристика за назвою вважала «qwen3-vl» візуальною навіть коли
+    LM Studio знала, що це текстова збірка, а «mystery» — ні, хоча це vlm."""
+    from igsaved.vision import looks_visual
+
+    types = {"qwen3-vl-4b-instruct": "llm", "mystery-model": "vlm", "nomic-embed": "embeddings"}
+    assert looks_visual("mystery-model", types) is True
+    assert looks_visual("qwen3-vl-4b-instruct", types) is False      # тип сильніший за назву
+    assert looks_visual("nomic-embed", types) is False
+    # тип невідомий — стара евристика
+    assert looks_visual("qwen3-vl-4b-instruct", {}) is True
+    assert looks_visual("llama-3.1-8b-instruct", None) is False
+    assert looks_visual("other-model", {"mystery-model": "vlm"}) is False
+
+
+def test_client_reads_types_and_context_from_the_native_endpoint(real_lm_calls):
+    from igsaved.vision import VisionClient
+
+    server = HTTPServer(("127.0.0.1", 0), _TypedLMStudio)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        client = VisionClient(f"http://127.0.0.1:{server.server_port}/v1")
+        assert client.model_types() == {"qwen3-vl-4b-instruct": "llm",
+                                        "mystery-model": "vlm", "nomic-embed": "embeddings"}
+        assert client.context_length("qwen3-vl-4b-instruct") == 4096
+        assert client.context_length("mystery-model") is None
+        # модель не вказана: перша ВІЗУАЛЬНА за типом, а не за назвою
+        assert client.resolve_model() == "mystery-model"
+    finally:
+        server.shutdown()
+
+    # сервер без /api/v0 — порожньо, а не виняток
+    assert VisionClient("http://127.0.0.1:9/v1").model_types() == {}
+
+
+def test_warm_up_failure_switches_the_run_to_the_backlog(tmp_path, real_lm_calls):
+    """Симптом: модель не завантажилась (400 при JIT) — запити з кадрами падали
+    один за одним, а пости лишались без опису назавжди."""
+    from igsaved.vision import VisionClient, VisionError
+
+    _TypedLMStudio.fail_load = True
+    _TypedLMStudio.posts.clear()
+    server = HTTPServer(("127.0.0.1", 0), _TypedLMStudio)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    engine, cfg, state = _engine(
+        tmp_path, vision_enabled=True, vision_describe_downloads=True,
+        vision_model="mystery-model", vision_url=f"http://127.0.0.1:{server.server_port}/v1")
+    try:
+        with pytest.raises(VisionError, match="Failed to load model"):
+            VisionClient(cfg.vision_url, model="mystery-model").warm_up()
+
+        lines = []
+        engine.log = lines.append
+        assert engine._setup_vision() is None
+        text = "\n".join(lines)
+        assert "Візуальна модель не піднялась" in text
+        assert "Failed to load model" in text
+        assert "у чергу дозапису" in text
+
+        # запит прогріву — текстовий, на один токен
+        warm = _TypedLMStudio.posts[0]
+        assert warm["max_tokens"] == 1
+        assert warm["messages"][0]["content"] == "ok"
+    finally:
+        _TypedLMStudio.fail_load = False
+        state.close()
+        server.shutdown()
+
+
+def test_warm_up_success_logs_model_type_and_context(tmp_path, real_lm_calls):
+    server = HTTPServer(("127.0.0.1", 0), _TypedLMStudio)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    engine, cfg, state = _engine(
+        tmp_path, vision_enabled=True, vision_describe_downloads=True,
+        vision_model="mystery-model", vision_url=f"http://127.0.0.1:{server.server_port}/v1")
+    try:
+        lines = []
+        engine.log = lines.append
+        client = engine._setup_vision()
+        assert client is not None
+        assert any("mystery-model" in line and "тип vlm" in line for line in lines)
+        # ця модель контекст не назвала — так і пишемо
+        assert any("контекст невідомий" in line for line in lines)
+    finally:
+        state.close()
+        server.shutdown()
+
+
+def test_describe_library_stops_when_the_model_will_not_warm_up(tmp_path, monkeypatch):
+    from igsaved import vision
+    from igsaved.maintenance import describe_library
+
+    def refuse(self, timeout=None):
+        raise vision.VisionError("LM Studio відповів 400: не вистачило памʼяті")
+
+    monkeypatch.setattr(vision.VisionClient, "resolve_model", lambda self: "vlm")
+    monkeypatch.setattr(vision.VisionClient, "warm_up", refuse)
+    state = State(tmp_path / "s.db")
+    try:
+        cfg = Config()
+        cfg.download_dir = str(tmp_path / "dl")
+        cfg.vision_enabled = True
+        lines = []
+        stats = describe_library(cfg, state, log=lines.append)
+        assert "не піднялась" in stats.error and "памʼяті" in stats.error
+        assert lines                         # мовчазної відмови не буває
+    finally:
+        state.close()
+
+
+# ------------------------------------------- черга дозапису з диска
+def _done_post(state, pk, path, *, caption="підпис", when="2026-09-01T10:00:00+00:00",
+               status="done", media_type=1, idx=0, kind="photo"):
+    state.record_media(pk, f"C{pk}", "studio", None, media_type, "feed", caption,
+                       f"https://www.instagram.com/p/C{pk}/", status="pending")
+    state.add_file(str(path), pk, kind, idx, 10)
+    state.mark_done(pk, status)
+    with state._lock:
+        state.db.execute("UPDATE media SET downloaded_at = ? WHERE pk = ?", (when, pk))
+        state.db.commit()
+
+
+def test_undescribed_files_lists_only_finished_posts_with_files_and_no_text(tmp_path):
+    """Симптом: пост із невдалим описом позначався done й ніхто не повертався
+    до нього — лише бібліотечний дозапис по 10 за прохід."""
+    state = State(tmp_path / "s.db")
+    try:
+        files = {name: _jpeg(tmp_path / f"{name}.jpg") for name in "abcde"}
+        _done_post(state, "1", files["a"], when="2026-09-01T10:00:00+00:00")   # старіший
+        _done_post(state, "2", files["b"], when="2026-09-03T10:00:00+00:00")   # описаний
+        state.set_ai_meta("2", "art", 0.9, "Вже є опис.", ["x"])
+        _done_post(state, "3", tmp_path / "gone.jpg", when="2026-09-04T10:00:00+00:00")  # файлу нема
+        _done_post(state, "4", files["d"], status="skipped")                   # не done
+        _done_post(state, "5", files["e"], when="2026-09-05T10:00:00+00:00")   # найновіший
+        # порожній опис не рахується за опис — це якраз той випадок
+        _done_post(state, "6", files["c"], when="2026-09-02T10:00:00+00:00")
+        state.set_ai_meta("6", "art", 0.9, "", [])
+
+        rows = state.undescribed_files()
+        assert [r[0] for r in rows] == ["5", "6", "1"]            # найновіші спершу
+        assert rows[0] == ("5", str(files["e"]), 0)
+        assert [r[0] for r in state.undescribed_files(limit=2)] == ["5", "6"]
+
+        # слайд каруселі описується окремо: опис idx=1 не закриває idx=2
+        _done_post(state, "7", _jpeg(tmp_path / "s1.jpg"), media_type=8, idx=1,
+                   when="2026-09-06T10:00:00+00:00")
+        state.add_file(str(_jpeg(tmp_path / "s2.jpg")), "7", "photo", 2, 10)
+        state.set_ai_meta("7", "art", 0.9, "Слайд 1.", ["a"], idx=1)
+        assert [(r[0], r[2]) for r in state.undescribed_files()][0] == ("7", 2)
+    finally:
+        state.close()
+
+
+def test_failed_description_is_queued_and_the_log_says_so(tmp_path):
+    from igsaved import vision
+
+    engine, cfg, state = _engine(tmp_path, vision_frames=3)
+    try:
+        photo = _jpeg(cfg.root / "p.jpg")
+        lines = []
+        engine.log = lines.append
+        engine._vision_model = "vlm"
+        engine._vision = types.SimpleNamespace(
+            classify=lambda images, **kw: vision.VisionVerdict(
+                error="модель не встигла відповісти"))
+        engine._describe(FakeMedia(media_type=1), "111", [(photo, 0)])
+        assert any("⤼ опис не склався: модель не встигла відповісти" in line
+                   and "спробую наступного проходу" in line for line in lines)
+        assert state.ai_meta("111") is None
+        # пост завершується як звичайно — і саме тому опиняється в черзі
+        _done_post(state, "111", photo)
+        assert [r[0] for r in state.undescribed_files()] == ["111"]
+    finally:
+        state.close()
+
+
+def test_backlog_describes_disk_posts_before_walking_eagle(tmp_path, monkeypatch):
+    """Черга з диска — раніше за обхід Eagle, у межах того самого бюджету, і
+    оновлює елемент Eagle за item_id, не затираючи ручні теги."""
+    pytest.importorskip("cv2")
+    from igsaved import maintenance, vision
+    from igsaved.eagle import EagleClient
+
+    _FakeEagle.updates = []
+    _FakeEagle.items = [
+        {"id": "aaa", "name": "studio_post", "ext": "jpg", "tags": ["instagram", "мої-теги"],
+         "annotation": "підпис автора", "url": "https://www.instagram.com/p/C500/"},
+    ]
+    server = HTTPServer(("127.0.0.1", 0), _FakeEagle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    engine, cfg, state = _engine(tmp_path, describe_backlog_per_run=10, vision_frames=3)
+    try:
+        engine.eagle = EagleClient(f"http://127.0.0.1:{server.server_port}")
+        photo = _jpeg(cfg.root / "studio_post.jpg")
+        _done_post(state, "500", photo, caption="підпис автора")
+        state.mark_in_eagle("500", "col1", "folder1", item_id="aaa")
+
+        engine._vision_model = "vlm"
+        engine._vision = types.SimpleNamespace(
+            classify=lambda images, **kw: vision.VisionVerdict(
+                category=vision.ART, confidence=0.9,
+                description="Скляна форма на темному тлі.",
+                tags=["glass"], on_screen_text="BRAND", frames=len(images)))
+
+        order = []
+
+        def fake_library(cfg_, state_, log, should_stop, limit=0, **kw):
+            order.append(("library", limit, state_.has_ai_meta("500")))
+            return maintenance.DescribeStats(described=0)
+
+        monkeypatch.setattr(maintenance, "describe_library", fake_library)
+        lines = []
+        engine.log = lines.append
+        engine._describe_backlog()
+
+        # опис з диска вже є до того, як почався обхід Eagle, а бюджет зменшено на 1
+        assert order == [("library", 9, True)]
+        assert any("── Дозапис описів: у черзі 1 постів з диска" in line for line in lines)
+        assert state.ai_meta("500")["description"] == "Скляна форма на темному тлі."
+        assert state.ai_meta("500")["prompt_hash"]
+        assert state.undescribed_files() == []
+
+        update = _FakeEagle.updates[0]
+        assert update["id"] == "aaa"
+        assert "мої-теги" in update["tags"] and "glass" in update["tags"]
+        assert "Visual summary: Скляна форма на темному тлі." in update["annotation"]
+        assert "підпис автора" in update["annotation"] and "BRAND" in update["annotation"]
+    finally:
+        state.close()
+        server.shutdown()
+
+
+def test_backlog_budget_counts_model_calls_and_stops_on_a_dead_server(tmp_path, monkeypatch):
+    from igsaved import maintenance, vision
+
+    engine, cfg, state = _engine(tmp_path, describe_backlog_per_run=2, vision_frames=3)
+    try:
+        for number in range(1, 5):
+            _done_post(state, str(number), _jpeg(cfg.root / f"{number}.jpg"),
+                       when=f"2026-09-0{number}T10:00:00+00:00")
+        calls = []
+        engine._vision_model = "vlm"
+        engine._vision = types.SimpleNamespace(
+            classify=lambda images, **kw: (
+                calls.append(1),
+                vision.VisionVerdict(error="LM Studio не відповідає"))[1])
+        monkeypatch.setattr(maintenance, "describe_library",
+                            lambda *a, **k: pytest.fail("Eagle не мав починатись"))
+        lines = []
+        engine.log = lines.append
+        engine._describe_backlog()
+        assert len(calls) == 1                 # мовчазний сервер — не мучимо решту черги
+        assert any("Модель мовчить" in line for line in lines)
+
+        # звичайна помилка бюджет витрачає, але черга йде далі
+        calls.clear()
+        engine._vision = types.SimpleNamespace(
+            classify=lambda images, **kw: (
+                calls.append(1),
+                vision.VisionVerdict(error="модель не встигла відповісти"))[1])
+        lines.clear()
+        engine._describe_backlog()
+        assert len(calls) == 2                 # бюджет 2
+        assert sum("спробую наступного проходу" in line for line in lines) == 2
+    finally:
+        state.close()
+
+
+def test_backlog_skips_describe_skip_collections(tmp_path):
+    from igsaved import vision
+
+    engine, cfg, state = _engine(tmp_path, describe_backlog_per_run=5, vision_frames=3,
+                                 describe_skip_collections=["col-skip"])
+    try:
+        _done_post(state, "1", _jpeg(cfg.root / "1.jpg"))
+        with state._lock:
+            state.db.execute(
+                "INSERT INTO membership (media_pk, collection_pk, collection_name, seen_at)"
+                " VALUES ('1', 'col-skip', 'Мемчики', 'x')")
+            state.db.commit()
+        calls = []
+        engine._vision_model = "vlm"
+        engine._vision = types.SimpleNamespace(
+            classify=lambda images, **kw: calls.append(1) or vision.VisionVerdict(error="x"))
+        engine._describe_backlog()
+        assert calls == []
+    finally:
+        state.close()
+
+
+# ------------------------------------------------------ режимні теги словника
+def test_tag_in_two_categories_is_visible_in_both_modes():
+    """Симптом: тег з однієї категорії падав у «відкинуті», бо індекс тримав лише
+    першу з кількох категорій, де він живе (motion-blur — у 3D TECHNIQUE і в
+    MOTION DESIGN; character-design — у 3D DESIGN і 2D DESIGN)."""
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    for tag in ("motion-blur", "character-design"):
+        assert len(tax._index[tag]) == 2
+        for mode in ("image", "video"):
+            kept, dropped = tax.normalize([tag], mode)
+            assert tag in kept and dropped == []
+    kept, dropped = tax.normalize(["cgi", "ai-generated"], "image")
+    assert kept[:2] == ["3d-render", "ai-generated"] and dropped == []   # різні категорії
+    assert tax.normalize(["mixed-media"], "image")[0][0] == "mixed-media"
+    assert tax.normalize(["mixed-media"], "video")[0][0] == "mixed-media"
+
+
+def test_three_d_render_aliases_depend_on_mode():
+    """Симптом: `3d-render` (сам словниковий тег картинок) ішов через alias у
+    відео-only `3d-animation` і викидався; 71 таких у tag_candidates."""
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    for mode in ("image", "video"):
+        # medium_video/medium_image злились: 3d-render — той самий тег в обох
+        # режимах, а cgi й 3d-animation — його синоніми.
+        for raw in ("3d-render", "cgi", "3d-animation", "render", "3d", "cgi-render"):
+            assert tax.normalize([raw], mode)[0] == ["3d-render", "autotagged"], (raw, mode)
+    # режимні alias — вбудовані: словник із файлу їх не перекриває
+    stale = Taxonomy.from_dict({**tax.to_dict(), "aliases": {"3d-render": "3d-animation"}})
+    assert stale.normalize(["3d-render"], "image")[0] == ["3d-render", "autotagged"]
+    assert stale.normalize(["3d-render"], "video")[0] == ["3d-render", "autotagged"]
+    # а `fashion` — справді залежить від режиму
+    assert tax.normalize(["fashion"], "video")[0][0] == "fashion-film"
+    assert tax.normalize(["fashion"], "image")[0][0] == "model"
+
+
+# ------------------------------------------------------------ summary (підсумок)
+def test_parse_answer_reads_summary_next_to_description():
+    from igsaved.vision import parse_answer
+
+    verdict = parse_answer(
+        '{"category":"art","confidence":0.9,"summary":"CGI car spot.",'
+        '"description":"A long note.","tags":[]}')
+    assert verdict.summary == "CGI car spot."
+    assert verdict.description == "A long note."
+    long_one = parse_answer('{"category":"art","summary":"' + "x" * 500 + '"}')
+    assert len(long_one.summary) == 300
+
+
+def test_summary_alone_counts_as_text():
+    from igsaved.vision import VisionVerdict
+
+    assert VisionVerdict(summary="One line.").has_text
+
+
+def test_annotation_puts_in_short_first_after_the_caption():
+    from igsaved.tagging import annotation
+
+    text = annotation("підпис", "опис", "екран", "голос", "Одне речення.")
+    assert text.split("\n\n") == [
+        "підпис", "In short: Одне речення.", "Visual summary: опис",
+        "On screen: екран", "Voice-over: голос"]
+    assert annotation("", "", summary="Лише так.") == "In short: Лише так."
+    assert MediaTags(caption="c", summary="S", description="d").comment().startswith(
+        "c\n\nIn short: S")
+
+
+def test_strip_description_removes_in_short_too():
+    """Симптом, який охороняємо: переопис наростив би «In short:» щоразу."""
+    from igsaved.maintenance import _strip_description
+    from igsaved.tagging import annotation
+
+    assert _strip_description(annotation("підпис", "опис", "", "", "S")) == "підпис"
+    assert _strip_description(annotation("", "опис", summary="S")) == ""
+
+
+def test_old_database_gets_the_summary_column_and_remember_stores_it(tmp_path):
+    from igsaved import vision
+    from igsaved.describe import remember
+
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(
+        "CREATE TABLE ai_meta (media_pk TEXT, idx INTEGER DEFAULT 0, category TEXT,"
+        " confidence REAL, description TEXT, tags TEXT, model TEXT, frames INTEGER,"
+        " created_at TEXT, PRIMARY KEY (media_pk, idx));"
+        "INSERT INTO ai_meta VALUES ('42',0,'art',0.9,'Старий.','a','m',1,'2026-01-01');"
+    )
+    legacy.commit()
+    legacy.close()
+
+    state = State(path)
+    try:
+        assert "summary" in state._columns("ai_meta")
+        assert state.ai_meta("42")["summary"] == ""
+        verdict = vision.VisionVerdict(category=vision.ART, confidence=0.9,
+                                       description="Нове.", summary="Коротко.")
+        assert remember(state, "43", 0, verdict, "vlm", "h") is True
+        assert state.ai_meta("43")["summary"] == "Коротко."
+    finally:
+        state.close()
+
+
+# ==========================================================================
+#  Словник v2: профілі й двокроковий вибір тегів
+# ==========================================================================
+def test_render_shows_only_the_profiles_it_is_asked_for():
+    """Симптом: один список на 2400 токенів для 4B-моделі — вона брала загальні
+    слова й не доходила до специфіки. Живе відео не має бачити MATERIALS."""
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    live = tax.render("video", ("core", "live"))
+    three_d = tax.render("video", ("core", "3d"))
+    everything = tax.render("video")
+    assert "CAMERA MOVEMENT" in live and "MATERIALS" not in live
+    assert "MATERIALS" in three_d and "CAMERA MOVEMENT" not in three_d
+    assert "LIGHTING QUALITY" in live and "LIGHTING QUALITY" in three_d     # core — завжди
+    assert "CAMERA MOVEMENT" in everything and "MATERIALS" in everything
+    assert "2D STYLE" in everything and "GRAPHIC DESIGN" in everything
+    assert len(live) < len(everything) and len(three_d) < len(everything)
+    # софт модель не бачить ніколи: його ставлять правила з тексту
+    assert "SOFTWARE" not in everything and "redshift" not in everything
+
+
+def test_normalize_accepts_tags_from_lists_the_model_never_saw():
+    """Профіль — про те, що ПОКАЗАТИ; перевіряє відповідь увесь словник."""
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    kept, dropped = tax.normalize(["chrome", "handheld", "anime"], "video")
+    assert kept[:3] == ["chrome", "handheld", "anime"] and dropped == []
+
+
+def test_ignored_tags_vanish_without_becoming_candidates():
+    """Симптом: `cinematic` стояв у 284 описах із 451, а `ad` — у «пропозиціях»."""
+    from igsaved.taxonomy import IGNORED_TAGS, Taxonomy
+
+    assert {"cinematic", "meme", "art", "ad", "game", "other"} <= IGNORED_TAGS
+    kept, dropped = Taxonomy().normalize(["cinematic", "ad"], "video")
+    assert kept == ["autotagged"] and dropped == []
+
+
+def test_new_aliases_follow_the_v2_vocabulary():
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    for mode in ("image", "video"):
+        assert tax.normalize(["cgi"], mode)[0][0] == "3d-render"
+        assert tax.normalize(["night"], mode)[0][0] == "night-scene"
+        assert tax.normalize(["blue-tones"], mode)[0][0] == "blue-dominant"
+        assert tax.normalize(["b3d"], mode)[0][0] == "blender"
+    kept, dropped = tax.normalize(["headshot", "vibrant", "first-person"], "video")
+    assert kept[:3] == ["close-up", "saturated-colors", "point-of-view"] and dropped == []
+    # старі видалені теги з близькою заміною не пропадають як «кандидати»
+    kept, dropped = tax.normalize(["film-grain", "polaroid", "sketch"], "image")
+    assert kept[:3] == ["grainy", "polaroid-look", "sketchy"] and dropped == []
+
+
+def test_exclusive_groups_and_limits_of_v2():
+    from igsaved.taxonomy import Taxonomy
+
+    tax = Taxonomy()
+    kept, _ = tax.normalize(["talking-head", "faceless", "day", "night-scene"], "video")
+    assert "talking-head" in kept and "faceless" not in kept
+    assert "day" in kept and "night-scene" not in kept
+    # cgi і ai-generated більше не виключають одне одного: origin окремо
+    kept, _ = tax.normalize(["3d-render", "ai-generated"], "video")
+    assert kept[:2] == ["3d-render", "ai-generated"]
+
+
+def test_profiles_for_follows_the_medium():
+    from igsaved.describe import profiles_for
+    from igsaved.taxonomy import VIDEO
+
+    assert profiles_for("3d-render", VIDEO) == ("core", "live", "3d")
+    assert profiles_for("live-action", VIDEO) == ("core", "live")
+    assert profiles_for("illustration", VIDEO) == ("core", "2d")
+    assert profiles_for("motion-graphics", VIDEO) == ("core", "motion", "graphic")
+    assert profiles_for("graphic-design", VIDEO) == ("core", "graphic")
+    # невідомо → усі чотири основні
+    for unknown in ("", "something-odd", None):
+        assert profiles_for(unknown, VIDEO) == ("core", "live", "3d", "motion")
+    # евристика за словами в описі: цілими, не підрядками
+    assert "3d" in profiles_for("live-action", VIDEO, "A Blender render of a car")
+    assert "graphic" in profiles_for("photograph", VIDEO, "Poster with a bold logo")
+    assert profiles_for("live-action", VIDEO, "gamestart rendezvous") == ("core", "live")
+
+
+def test_old_taxonomy_file_does_not_shadow_the_new_vocabulary(tmp_path):
+    """Файл, збережений до профілів, лишив би cinematic, студію й жодного 2D, а
+    його синоніми (`night → moonlight`) перекрили б нові."""
+    from igsaved.taxonomy import Taxonomy
+
+    path = tmp_path / "taxonomy.json"
+    path.write_text(json.dumps({
+        "categories": [{"key": "aesthetic", "title": "AESTHETIC", "limit": 1,
+                        "mode": "both", "note": "", "tags": ["cinematic", "vaporwave"]}],
+        "aliases": {"night": "moonlight"}, "exclusive": []}), encoding="utf-8")
+    assert Taxonomy.load(path).known("anime")           # вбудований, а не файл
+    Taxonomy.ensure_file(path)                          # власні теги не пропадають
+    assert (tmp_path / "taxonomy.pre-profiles.json").exists()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] >= 2
+    assert Taxonomy.load(path).known("anime")
+
+
+def test_profiles_survive_the_taxonomy_file_roundtrip(tmp_path):
+    from igsaved.taxonomy import Taxonomy
+
+    path = tmp_path / "taxonomy.json"
+    Taxonomy().save(path)
+    again = Taxonomy.load(path)
+    assert again.find_category("materials").profiles == ("3d",)
+    assert again.find_category("software").visible is False
+    assert "MATERIALS" not in again.render("video", ("core", "live"))
+    labels = dict(again.category_labels())
+    assert labels["materials"].endswith("(3d)") and labels["lighting_source"] == "LIGHTING SOURCE"
+
+
+def test_software_tags_come_from_whole_words_only():
+    """Бренд програми модель із кадру не бачить; «art» у «gamestart» — уже був баг."""
+    from igsaved.useful import software_tags
+
+    assert software_tags("Made in Blender + Redshift #c4d") == [
+        "blender", "redshift", "cinema-4d"]
+    assert software_tags("beautiful artwork", "gamestart", "") == []
+    # «render» — це техніка, а не програма
+    assert software_tags("Final render of the scene", "", "") == []
+    # двозначні слова — лише з хештегом
+    assert software_tags("unity of design, resolve the issue") == []
+    assert software_tags("clean motion", "", "", ["#AE", "#Houdini"]) == [
+        "after-effects", "houdini"]
+    assert software_tags("Cinema 4D and After Effects", "V-Ray | Unreal Engine") == [
+        "cinema-4d", "after-effects", "vray", "unreal-engine"]
+
+
+def test_prompt_hash_depends_on_both_prompts(monkeypatch):
+    """Зміна будь-якого з двох текстів має робити старі описи застарілими."""
+    from igsaved import vision
+
+    base = vision.prompt_hash("", "m", 896)
+    monkeypatch.setattr(vision, "TAG_PROMPT", vision.TAG_PROMPT + " Extra rule.")
+    assert vision.prompt_hash("", "m", 896) != base
+    monkeypatch.undo()
+    monkeypatch.setattr(vision, "DESCRIBE_PROMPT", vision.DESCRIBE_PROMPT + " Extra.")
+    assert vision.prompt_hash("", "m", 896) != base
+    monkeypatch.undo()
+    assert vision.prompt_hash("", "m", 896) == base
+    # і режим теж частина відбитка
+    assert vision.prompt_hash("", "m", 896, two_pass=False) != base
+
+
+class _TwoPassHandler(_LMStudioHandler):
+    """Фейк LM Studio для двох запитів: за текстом розрізняє, який із них."""
+
+    first = ('{"category": "art", "confidence": 0.9, "summary": "Neon car spot.",'
+             ' "description": "A car under neon.", "on_screen_text": "Neon Nights",'
+             ' "medium": "live-action", "why": "ok"}')
+    second = '{"tags": [{"tag": "Rim-Light", "evidence": "edge glow on the roof"}]}'
+    fail_second = False
+    seen: list = []
+
+    def do_POST(self):  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        self.seen.append(payload)
+        text = next(p["text"] for p in payload["messages"][0]["content"] if p["type"] == "text")
+        if "ALLOWED TAGS" in text:
+            if self.fail_second:
+                self._send({"error": "boom"}, 500)
+                return
+            self._send({"choices": [{"message": {"content": self.second}}]})
+        else:
+            self._send({"choices": [{"message": {"content": self.first}}]})
+
+
+def _two_pass_client(handler):
+    from igsaved.taxonomy import Taxonomy
+    from igsaved.vision import VisionClient
+
+    handler.seen = []
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = VisionClient(f"http://127.0.0.1:{server.server_port}/v1", model="vlm",
+                          taxonomy=Taxonomy())
+    return server, client
+
+
+def test_describe_then_tag_sends_two_requests_with_profile_lists():
+    """Симптом: одним запитом 4B-модель брала загальні слова. Другий запит бачить
+    лише списки цього поста й ті самі кадри перед текстом (кеш префікса)."""
+    server, client = _two_pass_client(_TwoPassHandler)
+    try:
+        verdict = client.describe_then_tag(
+            [b"\xff\xd8a", b"\xff\xd8b"], caption="neon spot #blender", kind="reel", mode="video")
+        assert len(_TwoPassHandler.seen) == 2
+        first, second = _TwoPassHandler.seen
+        text1 = next(p["text"] for p in first["messages"][0]["content"] if p["type"] == "text")
+        text2 = next(p["text"] for p in second["messages"][0]["content"] if p["type"] == "text")
+        assert "ALLOWED TAGS" not in text1 and "Caption: neon spot #blender" in text1
+        assert "A car under neon." in text2 and "Neon Nights" in text2
+        # live-action: є рух камери, немає матеріалів
+        assert "CAMERA MOVEMENT" in text2 and "MATERIALS" not in text2
+        assert second["max_tokens"] == 700
+        # зображення — ПЕРЕД текстом в обох запитах
+        for payload in (first, second):
+            kinds = [p["type"] for p in payload["messages"][0]["content"]]
+            assert kinds == ["image_url", "image_url", "text"]
+
+        assert verdict.medium == "live-action" and verdict.profiles == ("core", "live")
+        assert verdict.summary == "Neon car spot."
+        assert "rim-light" in verdict.tags and "blender" in verdict.tags     # + софт із тексту
+        assert verdict.tags[-1] == "autotagged" and not verdict.warning
+    finally:
+        server.shutdown()
+
+
+def test_describe_then_tag_shows_materials_for_a_3d_render():
+    class _Three(_TwoPassHandler):
+        first = _TwoPassHandler.first.replace("live-action", "3d-render")
+
+    server, client = _two_pass_client(_Three)
+    try:
+        verdict = client.describe_then_tag([b"\xff\xd8a"], kind="photo", mode="image")
+        text2 = next(p["text"] for p in _Three.seen[1]["messages"][0]["content"]
+                     if p["type"] == "text")
+        assert "MATERIALS" in text2 and "3D TECHNIQUE" in text2
+        assert verdict.profiles == ("core", "live", "3d")
+    finally:
+        server.shutdown()
+
+
+def test_describe_then_tag_keeps_the_description_when_tagging_fails():
+    """Симптом, якого не можна допустити: упав другий запит — і разом із ним
+    пропав уже написаний опис."""
+    class _Broken(_TwoPassHandler):
+        fail_second = True
+
+    server, client = _two_pass_client(_Broken)
+    try:
+        verdict = client.describe_then_tag(
+            [b"\xff\xd8a"], caption="made in #blender", kind="reel", mode="video")
+        assert verdict.description == "A car under neon." and not verdict.error
+        assert verdict.warning.startswith("теги не отримано:")
+        assert verdict.has_text
+        assert verdict.tags == ["blender", "autotagged"]      # лише правила з тексту
+    finally:
+        server.shutdown()
+
+
+def test_describe_then_tag_reports_a_failed_first_request():
+    class _Down(_TwoPassHandler):
+        def do_POST(self):  # noqa: N802
+            self._send({"error": "boom"}, 500)
+
+    server, client = _two_pass_client(_Down)
+    try:
+        verdict = client.describe_then_tag([b"\xff\xd8a"], kind="reel", mode="video")
+        assert verdict.error and not verdict.has_text
+    finally:
+        server.shutdown()
+
+
+def test_describe_file_honours_the_two_pass_switch(tmp_path):
+    from igsaved import describe
+
+    calls = []
+
+    class _Client:
+        def classify(self, shots, **kw):
+            calls.append("classify")
+            return describe.VisionVerdict()
+
+        def describe_then_tag(self, shots, **kw):
+            calls.append("two")
+            return describe.VisionVerdict()
+
+    cfg = Config()
+    describe.run_model(_Client(), [b"x"], cfg)
+    cfg.vision_two_pass = False
+    describe.run_model(_Client(), [b"x"], cfg)
+    assert calls == ["two", "classify"]
+
+
+def test_verdict_with_a_description_but_no_tags_is_saved(tmp_path):
+    """Теги — другий запит і можуть не прийти; опис від цього не стає сміттям."""
+    from igsaved import vision
+    from igsaved.describe import remember
+
+    verdict = vision.VisionVerdict(
+        category=vision.ART, confidence=0.9, description="Скло.", tags=["autotagged"],
+        warning="теги не отримано: boom", frames=3)
+    assert verdict.has_text
+    state = State(tmp_path / "s.db")
+    try:
+        assert remember(state, "42", 0, verdict, "vlm", "h") is True
+        assert state.ai_meta("42")["description"] == "Скло."
+    finally:
+        state.close()
+
+
+def test_profile_and_warning_are_logged_next_to_rejected(tmp_path):
+    from igsaved import vision
+    from igsaved.describe import log_rejected
+
+    lines = []
+    log_rejected(lines.append, vision.VisionVerdict(
+        medium="live-action", profiles=("core", "live"), warning="теги не отримано: x"))
+    assert lines == ["   ◫ профіль: live-action → core, live", "   ⤼ теги не отримано: x"]

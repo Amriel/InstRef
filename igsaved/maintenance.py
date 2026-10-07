@@ -63,6 +63,7 @@ class _Post:
     collections: List[str] = None
     files: List[Path] = None
     description: str = ""       # від візуальної моделі — про пост загалом
+    summary: str = ""           # одне речення про пост загалом
     ai_tags: List[str] = None
     # Номер слайда для кожного файлу і опис саме для нього: в каруселі
     # картинки різні, і спільний текст був би неправдою про кожну з них.
@@ -156,6 +157,7 @@ def _from_state(state: State) -> Dict[str, _Post]:
                 collections=state.collection_names_for(pk),
                 collection_pks=state.collection_pks_for(pk),
                 description=ai.get("description", ""),
+                summary=ai.get("summary", ""),
                 ai_tags=list(ai.get("tags", [])),
                 ai_by_idx={
                     key[1]: value for key, value in ai_all.items()
@@ -227,6 +229,7 @@ def _refresh_post(cfg, state, post: _Post, stats: RefreshStats,
         collections=post.collections,
         hashtags=hashtags(post.caption),
         description=post.description,
+        summary=post.summary,
         ai_tags=post.ai_tags,
     )
 
@@ -236,6 +239,7 @@ def _refresh_post(cfg, state, post: _Post, stats: RefreshStats,
         current = path
         slide = post.meta_for(idx)
         tags.description = slide.get("description", post.description)
+        tags.summary = slide.get("summary", post.summary)
         tags.ai_tags = list(slide.get("tags", post.ai_tags))
         try:
             if rename:
@@ -564,6 +568,7 @@ def describe_library(
     model_override — інша модель LM Studio, ніж у налаштуваннях (переопис
     сильнішою моделлю).
     """
+    from . import describe
     from . import frames as framegrab
     from . import taxonomy
     from . import vision
@@ -575,6 +580,7 @@ def describe_library(
         log(stats.error)
         return stats
 
+    describe.log_migration_notes(cfg, log)
     client = vision.client_for(cfg)
     if model_override:
         client.model = model_override.strip()
@@ -584,7 +590,16 @@ def describe_library(
         stats.error = f"Модель недоступна: {exc}"
         log(stats.error)
         return stats
-    log(f"Модель: {model}")
+    try:
+        # Вантажимо модель окремо й із запасом часу: JIT-завантаження всередині
+        # запиту з кадрами впирається в таймаут, і елемент лишається без опису.
+        client.warm_up()
+    except vision.VisionError as exc:
+        stats.error = f"Візуальна модель не піднялась: {exc}"
+        log(stats.error)
+        return stats
+    log(f"Модель: {model} (тип {client.model_type(model) or 'невідомий'}, "
+        f"контекст {client.context_length(model) or 'невідомий'})")
 
     eagle = EagleClient(cfg.eagle_url, cfg.eagle_token)
     try:
@@ -612,14 +627,15 @@ def describe_library(
     except EagleError:
         folders = None
 
-    base = max(1, min(vision.MAX_FRAMES, int(cfg.vision_frames or 1)))
     stems = state.files_by_stem()
     urls = state.media_by_url()
-    current_hash = vision.prompt_hash(cfg.vision_prompt, model)
+    current_hash = vision.prompt_hash(
+        cfg.vision_prompt, model, describe.frame_side(cfg),
+        two_pass=bool(getattr(cfg, "vision_two_pass", True)))
     examples = state.exemplars()
     missing_ids = set(state.without_eagle_item_id())
     skip_pks = _pks_in_collections(state, cfg.describe_skip_collections)
-    per = float(cfg.vision_seconds_per_frame or 0)
+    seen_notes: set = set()
 
     log("Читаю бібліотеку Eagle…")
     for item in eagle.iter_items(folders):
@@ -657,16 +673,17 @@ def describe_library(
             stats.missing += 1
             continue
 
-        want = base
         log(f"   … {(name or Path(path).stem)[:44]}: дістаю кадри")
-        if Path(path).suffix.lower() in framegrab.VIDEO_EXT:
-            if per > 0:
-                want = framegrab.frame_budget(framegrab.video_duration(Path(path)),
-                                              base, vision.MAX_FRAMES, per)
-            shots = framegrab.extract(Path(path), want, by_scene=cfg.vision_frames_by_scene)
-        else:
-            shots = framegrab.shots_from_file(Path(path), want)
-        if not shots:
+        name = name or Path(path).stem
+        mode = taxonomy.mode_for(path)
+        ctx = describe.DescribeContext(
+            caption=_strip_description(annotation)[:400],
+            kind="reel" if mode == taxonomy.VIDEO else "photo", mode=mode,
+            collections=state.collection_names_for(known[0]) if known else None,
+            examples=examples, cfg=cfg, log=log, label=name, seen_notes=seen_notes,
+        )
+        answer = describe.describe_file(client, Path(path), ctx)
+        if answer.error == describe.NO_FRAMES_ERROR:
             stats.missing += 1
             continue
 
@@ -676,18 +693,8 @@ def describe_library(
             if prints:
                 state.set_fingerprints(known[0], known[1], prints)
 
-        name = name or Path(path).stem
-        mode = taxonomy.mode_for(path)
-        # Один елемент — це десятки кадрів і запит до моделі на хвилини. Без
-        # цього рядка журнал мовчить увесь цей час, і виглядає як зависання.
-        log(f"   … {name[:44]}: {len(shots)} кадр(ів), питаю модель…")
-        answer = client.classify(shots, caption=_strip_description(annotation)[:400],
-                                 kind="reel" if mode == taxonomy.VIDEO else "photo",
-                                 mode=mode,
-                                 collections=state.collection_names_for(known[0]) if known else None,
-                                 examples=examples)
-        if answer.dropped:
-            state.note_tag_candidates(answer.dropped)
+        describe.log_rejected(log, answer)
+        describe.note_dropped(state, answer)
         if answer.error and not answer.has_text:
             stats.failed += 1
             log(f"   ✖ {name[:50]}: {answer.error}")
@@ -697,27 +704,12 @@ def describe_library(
             log(f"   ⤼ {name[:50]}: модель нічого не написала")
             continue
 
-        old_ai = set()
+        previous_ai = []
         if known and (redo or only_stale):
             # Переопис: старі теги моделі прибираємо, ручні теги власника лишаються.
-            previous = state.ai_meta(known[0], known[1]) or {}
-            old_ai = {str(t).lower() for t in previous.get("tags", [])}
-        tags = [t for t in (item.get("tags") or []) if str(t).lower() not in old_ai] \
-            + list(answer.tags)
-        seen_tags, unique = set(), []
-        for tag in tags:
-            key = str(tag).strip().lower()
-            if key and key not in seen_tags:
-                seen_tags.add(key)
-                unique.append(str(tag).strip())
+            previous_ai = (state.ai_meta(known[0], known[1]) or {}).get("tags", [])
         try:
-            eagle.update_item(
-                str(item.get("id")),
-                tags=unique,
-                annotation=tagging.annotation(
-                    _strip_description(annotation), answer.description,
-                    answer.on_screen_text),
-            )
+            describe.merge_into_eagle_item(eagle, item, answer, previous_ai)
         except EagleError as exc:
             stats.failed += 1
             log(f"   ✖ {name[:50]}: Eagle не прийняв — {exc}")
@@ -729,11 +721,8 @@ def describe_library(
         # Якщо пост відомий базі — лишаємо опис і в себе, щоб він потрапляв
         # у майбутні файли й не питався вдруге.
         if known:
-            pk, idx = known
-            state.set_ai_meta(pk, answer.category if answer.ok else "",
-                              answer.confidence, answer.description, answer.tags,
-                              model, answer.frames, idx=idx, prompt_hash=current_hash,
-                              screen_text=answer.on_screen_text)
+            describe.remember(state, known[0], known[1], answer, model, current_hash,
+                              count_dropped=False)
 
     if getattr(cfg, "vision_unload_after_run", True):
         # Кілька гігабайт VRAM не мають висіти після того, як опис закінчено.
@@ -949,11 +938,14 @@ def _by_url(urls: Dict[str, str], url) -> Optional[tuple]:
 def _strip_description(annotation: str) -> str:
     """Прибирає наш попередній опис (і текст з екрана), щоб повторний прохід
     не наростив хвіст."""
-    for candidate in (*DESCRIPTION_MARKS, tagging.SCREEN_LABEL):
-        head, mark, _ = annotation.partition(f"\n\n{candidate}")
+    # Блоки відокремлені порожнім рядком; без підпису наш блок стоїть на самому
+    # початку, тож додаємо штучний роздільник, щоб його теж знайти.
+    text = "\n\n" + annotation
+    for candidate in (tagging.SHORT_LABEL, *DESCRIPTION_MARKS, tagging.SCREEN_LABEL):
+        head, mark, _ = text.partition(f"\n\n{candidate}")
         if mark:
-            annotation = head
-    return annotation
+            text = head
+    return text[2:] if text.startswith("\n\n") else text
 
 
 def _pks_in_collections(state: State, collection_pks) -> set:
@@ -1212,7 +1204,8 @@ def _eagle_item(cfg: Config, post: _Post, collection: str, path: Path, idx: int 
         website=f"https://www.instagram.com/p/{post.code}/" if post.code else "",
         annotation=tagging.annotation(
             post.caption, slide.get("description", post.description),
-            slide.get("screen_text", ""), slide.get("transcript", "")),
+            slide.get("screen_text", ""), slide.get("transcript", ""),
+            slide.get("summary", post.summary)),
         tags=unique,
     )
 

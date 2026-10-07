@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from . import classify as classifier
+from . import describe
 from . import frames as framegrab
 from . import taxonomy
 from . import transcribe
@@ -122,6 +123,8 @@ class SyncEngine:
         )
         self._vision = None
         self._vision_model = ""
+        # Рядки про вписування кадрів у контекст, які вже показані за прохід.
+        self._plan_notes: set = set()
         # Ролики, завантажені наперед заради кадрів: url → файл у _cache.
         # Схвалене відео потім переїжджає на місце, а не качається вдруге.
         self._prefetch: Dict[str, Path] = {}
@@ -483,6 +486,7 @@ class SyncEngine:
         if not self.cfg.classify_liked and not self.cfg.vision_describe_downloads:
             self.log("Візуальна модель не потрібна: фільтр мемів і опис вимкнено.")
             return None
+        describe.log_migration_notes(self.cfg, self.log)
         client = vision.client_for(self.cfg)
         try:
             model = client.resolve_model()
@@ -490,72 +494,87 @@ class SyncEngine:
             self.log(f"Візуальна модель пропущена: {exc} Працюю за правилами.")
             return None
         self._vision_model = model
-        if not vision.looks_visual(model):
+        # Прогрів: LM Studio вантажить модель при першому запиті (45–60 с), і
+        # якщо це трапиться всередині запиту з кадрами, він упреться в таймаут,
+        # а пост лишиться без опису. Вантажимо окремо й із запасом часу.
+        try:
+            client.warm_up()
+        except vision.VisionError as exc:
+            self.log(
+                f"Візуальна модель не піднялась: {exc}. Описів цього проходу не буде, "
+                "пости підуть у чергу дозапису."
+            )
+            return None
+        types = client.model_types()
+        if not vision.looks_visual(model, types):
             self.log(
                 f"⚠ Модель «{model}» виглядає текстовою: вона не побачить кадрів і "
                 "описів не буде. Обери візуальну (наприклад, qwen3-vl-4b-instruct) у "
                 "Модель → Підключення."
             )
-        want = max(1, int(self.cfg.vision_frames or 1))
-        if want > 1 and not framegrab.available():
+        cap = describe.ceiling(self.cfg)
+        if cap > 1 and not framegrab.available():
             self.log(
                 "Візуальна модель: opencv не встановлено — бачитиме лише обкладинку. "
                 "Перезапусти install.bat, щоб модель дивилась відео цілком."
             )
-        self.log(f"Візуальна модель: {model} ({want} кадр(ів) з ролика)")
+        context = client.context_length()
+        self.log(
+            f"Візуальна модель: {model} (тип {types.get(model) or 'невідомий'}, "
+            f"контекст {context or 'невідомий'}; до {cap} кадр(ів) по "
+            f"{describe.frame_side(self.cfg)} px)"
+        )
         return client
+
+    def _note_plan(self, plan) -> None:
+        describe.note_once(
+            describe.DescribeContext(log=self.log, seen_notes=self._plan_notes), plan.note)
+
+    def _prompt_hash(self) -> str:
+        return vision.prompt_hash(
+            self.cfg.vision_prompt, self._vision_model, describe.frame_side(self.cfg),
+            two_pass=bool(getattr(self.cfg, "vision_two_pass", True)))
 
     # -------------------------------------------------- кадри для моделі
     def _frames_for(self, media) -> tuple[List[bytes], str]:
         """Кадри одного поста плюс те, чим цей пост є для інструкції.
 
+        Джерела (prefetch-ролик, слайди, обкладинка) лишаються тут, а скільки
+        кадрів і якого розміру — вирішує describe.plan_frames, як і всюди.
+
         Відео завантажується наперед у _cache: інакше кадрів не дістати, а
         качати ролик двічі — марно витрачений трафік.
         """
-        want = max(1, min(vision.MAX_FRAMES, int(self.cfg.vision_frames or 1)))
         mtype = int(getattr(media, "media_type", 0) or 0)
         kind = label_for(media)
+        context = describe.context_length(self._vision)
+        side = describe.plan_frames(None, self.cfg, context).side
 
-        if mtype == 2 and want > 1 and framegrab.available():
+        if mtype == 2 and describe.ceiling(self.cfg) > 1 and framegrab.available():
             path = self._prefetch_video(media)
             if path is not None:
-                want = self._budget(path, want)
-                shots = framegrab.extract(path, want, by_scene=self.cfg.vision_frames_by_scene)
+                plan = describe.plan_frames(path, self.cfg, context)
+                self._note_plan(plan)
+                shots = describe.shots_for(path, plan, self.cfg.vision_frames_by_scene)
                 if shots:
-                    if want > vision.SAFE_FRAMES:
-                        # Про здрібнення кадрів варто сказати вголос: інакше
-                        # незрозуміло, чому модель раптом гірше читає дрібний текст.
-                        self.log(
-                            f"   ⤓ {len(shots)} кадр(ів) по {framegrab.side_for(want)} px"
-                        )
                     return shots, kind
                 self.log("   ⤼ кадри з ролика не дістались — дивлюсь обкладинку")
 
         if mtype == 8:
+            plan = describe.fit_plan(describe.ceiling(self.cfg), side, context)
+            self._note_plan(plan)
             shots = []
-            side = framegrab.side_for(want)
-            for url in vision.slide_urls(media, want):
+            for url in vision.slide_urls(media, plan.count):
                 data = vision.fetch_image(url, self.cfg.request_timeout, self.cfg.proxy)
                 if data:
-                    shots.append(framegrab.shrink_image(data, side))
+                    shots.append(framegrab.shrink_image(data, plan.side))
             if shots:
                 return shots, kind
 
         cover = vision.fetch_image(
             vision.thumbnail_url(media), self.cfg.request_timeout, self.cfg.proxy
         )
-        return ([framegrab.shrink_image(cover)] if cover else []), kind
-
-    def _budget(self, path: Path, base: int) -> int:
-        """Скільки кадрів брати з цього конкретного ролика."""
-        per = float(self.cfg.vision_seconds_per_frame or 0)
-        if per <= 0:
-            return base
-        duration = framegrab.video_duration(path)
-        want = framegrab.frame_budget(duration, base, vision.MAX_FRAMES, per)
-        if want != base and duration:
-            self.log(f"   ⤓ {int(duration)} с → {want} кадр(ів)")
-        return want
+        return ([framegrab.shrink_image(cover, side)] if cover else []), kind
 
     def _prefetch_video(self, media) -> Optional[Path]:
         url = str(getattr(media, "video_url", "") or "")
@@ -619,8 +638,8 @@ class SyncEngine:
 
         user = getattr(media, "user", None)
         pk = str(getattr(media, "pk", "") or "")
-        answer = self._vision.classify(
-            shots,
+        answer = describe.run_model(
+            self._vision, shots, self.cfg,
             caption=getattr(media, "caption_text", "") or "",
             username=(getattr(user, "username", "") if user else "") or "",
             kind=kind, mode=taxonomy.mode_for(kind),
@@ -633,7 +652,8 @@ class SyncEngine:
 
         if not answer.ok:
             if answer.error:
-                self.log(f"   ⤼ модель не відповіла: {answer.error}")
+                self.log(f"   ⤼ модель не відповіла: {answer.error}"
+                         + (" — спробую наступного проходу" if not answer.has_text else ""))
             return False
 
         seen = f" ({answer.frames} кадр.)" if answer.frames > 1 else ""
@@ -671,20 +691,14 @@ class SyncEngine:
         )
 
     def _save_ai(self, media, answer, idx: int = 0, label: str = "") -> None:
-        # Відкинуті теги рахуємо завжди — навіть коли решту відповіді не беремо.
-        if answer.dropped:
-            self.state.note_tag_candidates(answer.dropped)
-        if not (answer.description or answer.tags or answer.ok):
-            return
         pk = str(getattr(media, "pk", "") or "")
-        if not pk:
-            return
-        self.state.set_ai_meta(
-            pk, answer.category if answer.ok else "", answer.confidence,
-            answer.description, answer.tags, self._vision_model, answer.frames,
-            idx=idx, prompt_hash=vision.prompt_hash(self.cfg.vision_prompt, self._vision_model),
-            screen_text=answer.on_screen_text, transcript=getattr(answer, "transcript", ""),
-        )
+        saved = describe.remember(
+            self.state, pk, idx, answer, self._vision_model, self._prompt_hash())
+        describe.log_rejected(self.log, answer)
+        if saved:
+            self._log_description(answer, label)
+
+    def _log_description(self, answer, label: str = "") -> None:
         prefix = f"[{label}] " if label else ""
         if answer.description:
             self.log(f"   ✎ {prefix}{answer.short_description()}")
@@ -702,10 +716,12 @@ class SyncEngine:
         Кожен файл описується окремо. Для ролика це один запит на кілька його
         кадрів, а от карусель — це різні картинки, і спільний опис на всі був би
         неправдою про кожну з них.
+
+        Невдалий опис не губиться: пост лишається без запису в ai_meta, і
+        _describe_backlog підхопить його наступного проходу.
         """
         if self._vision is None:
             return
-        base = max(1, min(vision.MAX_FRAMES, int(self.cfg.vision_frames or 1)))
         user = getattr(media, "user", None)
         caption = getattr(media, "caption_text", "") or ""
         username = (getattr(user, "username", "") if user else "") or ""
@@ -719,31 +735,27 @@ class SyncEngine:
                 return
             if self.state.has_ai_meta(pk, idx):
                 continue
-            want = base
-            if path.suffix.lower() in framegrab.VIDEO_EXT:
-                want = self._budget(path, base)
-                shots = framegrab.extract(path, want, by_scene=self.cfg.vision_frames_by_scene)
-            else:
-                shots = framegrab.shots_from_file(path, want)
-            if not shots:
+            is_video = path.suffix.lower() in framegrab.VIDEO_EXT
+            ctx = describe.DescribeContext(
+                caption=caption, username=username,
+                kind="photo" if (multi and not is_video) else kind,
+                mode=taxonomy.mode_for(path.name),
+                collections=collections, examples=examples,
+                transcript=self._transcript(path, pk),
+                cfg=self.cfg, log=self.log, seen_notes=self._plan_notes,
+            )
+            answer = describe.describe_file(self._vision, path, ctx)
+            if answer.error == describe.NO_FRAMES_ERROR:
                 self.log(f"   ⤼ нема з чого описати {path.name}")
                 continue
-            speech = self._transcript(path, pk)
-            answer = self._vision.classify(
-                shots, caption=caption, username=username,
-                kind="photo" if (multi and path.suffix.lower() not in
-                                 framegrab.VIDEO_EXT) else kind,
-                mode=taxonomy.mode_for(path.name),
-                collections=collections, examples=examples, transcript=speech,
-            )
-            answer.transcript = speech
             if answer.error and not answer.has_text:
-                self.log(f"   ⤼ опис не склався: {answer.error}")
+                self.log(f"   ⤼ опис не склався: {answer.error} — спробую наступного проходу")
                 continue
             if not answer.has_text:
                 # Модель відповіла, але нічого не написала. Мовчки збережений
                 # порожній рядок назавжди заблокував би повторну спробу.
-                self.log("   ⤼ модель не написала ні опису, ні тегів")
+                self.log("   ⤼ модель не написала ні опису, ні тегів — спробую наступного проходу")
+                describe.log_rejected(self.log, answer)
                 continue
             self._save_ai(media, answer, idx=idx,
                           label=path.name if multi else "")
@@ -1119,6 +1131,31 @@ class SyncEngine:
             collections=self.state.collection_names_for(pk) or [col.display],
             hashtags=hashtags(caption),
             description=ai.get("description", ""),
+            summary=ai.get("summary", ""),
+            ai_tags=ai.get("tags", []),
+        )
+        ok, problem = tagging.apply(path, tags)
+        if not ok and problem:
+            self.log(f"   ⤼ {path.name}: {problem}")
+
+    def _embed_known(self, pk: str, path: Path, idx: int, row) -> None:
+        """Перешиває метадані файлу з бази — коли опис зʼявився вже після завантаження."""
+        from .maintenance import _kind, _parse_date
+
+        ai = self.state.ai_meta(pk, idx) or {}
+        caption = str(row["caption"] or "")
+        code = str(row["code"] or "")
+        tags = MediaTags(
+            title=caption_slug(caption) or code,
+            author=str(row["username"] or "unknown"),
+            caption=caption,
+            url=str(row["url"] or "") or media_url(code),
+            taken_at=_parse_date(row["taken_at"]),
+            kind=_kind(row["media_type"], row["product_type"]),
+            collections=self.state.collection_names_for(pk),
+            hashtags=hashtags(caption),
+            description=ai.get("description", ""),
+            summary=ai.get("summary", ""),
             ai_tags=ai.get("tags", []),
         )
         ok, problem = tagging.apply(path, tags)
@@ -1239,28 +1276,116 @@ class SyncEngine:
             )
 
     def _describe_backlog(self) -> None:
-        """Після проходу — ще кілька описів для старої бібліотеки.
+        """Після проходу — дозапис описів: спершу з диска, потім зі старої бібліотеки.
 
         Бекфіл руками — багатогодинний і тому не робиться. Десяток елементів
         за прохід непомітний, а за місяць планових проходів покриває бібліотеку.
+        Спершу йдуть пости, що вже лежать на диску без опису (там опис не
+        склався при завантаженні — LM Studio не піднялась, таймаут JIT), бо це
+        свіже й найцінніше; решту бюджету віддаємо обходу Eagle.
         """
         budget = int(self.cfg.describe_backlog_per_run or 0)
-        if budget <= 0 or self._vision is None or not self.eagle:
+        if budget <= 0 or self._vision is None:
             return
         if self.should_stop():
             return
+        done = 0
+        try:
+            done = self._describe_disk_backlog(budget)
+        except Exception as exc:  # noqa: BLE001 — бонус не має валити прохід
+            self.log(f"   ⤼ дозапис описів з диска не вдався: {exc}")
+        left = budget - done
+        if left <= 0 or not self.eagle or self.should_stop():
+            return
         from .maintenance import describe_library
 
-        self.log(f"── Дописую описи бібліотеці Eagle (до {budget} за прохід)")
+        self.log(f"── Дописую описи бібліотеці Eagle (до {left} за прохід)")
         try:
             result = describe_library(
-                self.cfg, self.state, self.log, self.should_stop, limit=budget,
+                self.cfg, self.state, self.log, self.should_stop, limit=left,
             )
         except Exception as exc:  # noqa: BLE001 — бонус не має валити прохід
             self.log(f"   ⤼ дозапис описів не вдався: {exc}")
             return
         if result.described:
             self.log(f"   описано ще {result.described}")
+
+    def _describe_disk_backlog(self, budget: int) -> int:
+        """Описує файли з диска, що лишились без опису. Повертає, скільки описано.
+
+        У бюджет рахуються лише справжні звернення до моделі: файл, з якого не
+        дістати кадрів (битий ролик), інакше з'їдав би місце в голові черги
+        кожного проходу й ніколи б не пропускав далі.
+        """
+        from .maintenance import _kind, _pks_in_collections
+
+        skip = _pks_in_collections(self.state, self.cfg.describe_skip_collections)
+        rows = [r for r in self.state.undescribed_files(0) if r[0] not in skip]
+        if not rows:
+            return 0
+        posts = len({r[0] for r in rows})
+        self.log(f"── Дозапис описів: у черзі {posts} постів з диска")
+
+        item_ids = self.state.eagle_item_ids() if self.eagle else {}
+        examples = self.state.exemplars()
+        attempted = described = 0
+        for pk, path_text, idx in rows:
+            if self.should_stop() or attempted >= budget:
+                break
+            path = Path(path_text)
+            row = self.state.media_row(pk)
+            if row is None:
+                continue
+            is_video = path.suffix.lower() in framegrab.VIDEO_EXT
+            kind = _kind(row["media_type"], row["product_type"])
+            ctx = describe.DescribeContext(
+                caption=str(row["caption"] or ""), username=str(row["username"] or ""),
+                kind=kind if is_video else "photo",
+                mode=taxonomy.mode_for(path.name),
+                collections=self.state.collection_names_for(pk), examples=examples,
+                transcript=self._transcript(path, pk),
+                cfg=self.cfg, log=self.log, label=path.name, seen_notes=self._plan_notes,
+            )
+            answer = describe.describe_file(self._vision, path, ctx)
+            if answer.error == describe.NO_FRAMES_ERROR:
+                self.log(f"   ⤼ нема з чого описати {path.name}")
+                continue
+            attempted += 1
+            if answer.error and not answer.has_text:
+                self.log(f"   ⤼ опис не склався: {answer.error} — спробую наступного проходу")
+                if "не відповідає" in answer.error:
+                    self.log("   Модель мовчить — дозапис з диска зупинено до наступного проходу.")
+                    break
+                continue
+            if not answer.has_text:
+                self.log("   ⤼ модель не написала ні опису, ні тегів — спробую наступного проходу")
+                describe.log_rejected(self.log, answer)
+                continue
+            if not describe.remember(self.state, pk, idx, answer, self._vision_model,
+                                     self._prompt_hash()):
+                continue
+            describe.log_rejected(self.log, answer)
+            self._log_description(answer, path.name)
+            described += 1
+
+            # Нове знання має дійти до самого файлу й до Eagle — інакше воно
+            # лишилось би тільки в базі.
+            self._embed_known(pk, path, idx, row)
+            item_id = item_ids.get(pk)
+            # Один item_id на пост: для каруселі він належить першому слайду, і
+            # описи інших не мають його перезаписувати.
+            if self.eagle and item_id and idx <= 1:
+                try:
+                    item = self.eagle.get_item(item_id)
+                    if item:
+                        describe.merge_into_eagle_item(self.eagle, item, answer)
+                    else:
+                        self.log(f"   ⤼ елемента Eagle {item_id} не знайдено")
+                except EagleError as exc:
+                    self.log(f"   ⤼ Eagle не прийняв опис: {exc}")
+        if described:
+            self.log(f"   описано з диска: {described}")
+        return described
 
     # =============================================================== Eagle
     def _setup_eagle(self) -> None:
@@ -1387,7 +1512,7 @@ class SyncEngine:
             name=short_title(caption, username, code),
             website=media_url(code),
             annotation=annotation(caption, ai.get("description", ""), ai.get("screen_text", ""),
-                                  ai.get("transcript", "")),
+                                  ai.get("transcript", ""), ai.get("summary", "")),
             tags=unique,
         )
 

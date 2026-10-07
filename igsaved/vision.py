@@ -23,7 +23,8 @@ from typing import List, Optional, Sequence
 
 import requests
 
-from .useful import useful_tags
+from .taxonomy import DEFAULT_ALIASES, profiles_for
+from .useful import software_tags, useful_tags
 
 # Категорії, якими оперує модель. Свідомо короткі й непересічні.
 MEME = "meme"
@@ -44,13 +45,17 @@ CATEGORY_LABELS = {
 
 DEFAULT_URL = "http://localhost:1234/v1"
 
-# Стеля кількості кадрів в одному запиті. Висока свідомо: скільки саме витягне
-# конкретна модель — питання її контексту й памʼяті, а не наше. Але кожен кадр
-# коштує сотні токенів, тож вище SAFE_FRAMES застосунок попереджає, що
-# відповіді можуть почати ламатись.
-MAX_FRAMES = 60
-SAFE_FRAMES = 12
+# Стеля кількості кадрів в одному запиті. Низька свідомо: вимірювання на
+# реальних файлах показали, що 6–12 великих кадрів (≈900 px) читають текст на
+# екрані й дають чесніші теги, а десятки дрібних (≈400 px) модель лише
+# перераховує («Later frames show…») і галюцинує теги зі словника.
+MAX_FRAMES = 32
 MAX_TAGS = 15
+
+# Заперечення в «доказі» тегу: модель сама пише «no visible sneakers», але
+# тег усе одно кладе у список. Такі теги відкидаємо кодом, а не проханням.
+NEGATIVE_EVIDENCE = re.compile(
+    r"\b(no|not|none|absent|without|unclear|cannot|can't|n/a)\b", re.IGNORECASE)
 
 
 # Ознаки візуальної моделі в її назві. Текстова модель приймає запит з
@@ -61,12 +66,21 @@ VISUAL_MARKS = ("vl", "vision", "llava", "moondream", "pixtral", "minicpm-v", "i
                 "phi-4-multimodal", "smolvlm", "molmo", "qvq", "4o", "omni", "vlm")
 
 
-def looks_visual(model_id: str) -> bool:
-    """Чи схожа назва моделі на візуальну. Евристика, але дешева й чесна."""
-    name = (model_id or "").lower()
+def looks_visual(model_id: str, types: Optional[dict] = None) -> bool:
+    """Чи візуальна модель.
+
+    Якщо LM Studio сказала тип (`/api/v0/models` → vlm / llm / embeddings), вирішує
+    він: назва бреше в обидва боки («qwen3-vl» без vision-частини, «gemma-3» без
+    картинок у деяких квантах). Без типу лишається евристика за назвою.
+    """
+    name = (model_id or "").strip()
     if not name:
         return True   # невідомо — не лякаємо
-    return any(mark in name for mark in VISUAL_MARKS)
+    known = (types or {}).get(name)
+    if known:
+        return str(known).lower() == "vlm"
+    lowered = name.lower()
+    return any(mark in lowered for mark in VISUAL_MARKS)
 
 
 def api_root(url: str) -> str:
@@ -114,13 +128,16 @@ PLACEHOLDERS = {
     "{frames}": "скільки кадрів надіслано",
     "{kind}": "reel / video / carousel / photo",
     "{mode}": "VIDEO або IMAGE",
-    "{taxonomy}": "списки дозволених тегів зі словника",
+    # Теги тепер окремим запитом (TAG_PROMPT), тож у цій інструкції
+    # {taxonomy} завжди порожній рядок; працює лише в однозапитному режимі.
+    "{taxonomy}": "порожньо (теги — окремим запитом; у режимі одного запиту — списки словника)",
     "{examples}": "зразки описів, які ти схвалив у перегляді",
 }
 
-DEFAULT_PROMPT = """You are tagging a visual reference library for a 3D generalist and
+_PROMPT_HEAD = """You are tagging a visual reference library for a 3D generalist and
 art director. It holds Instagram references: advertising, fashion, automotive,
-CGI and AI work, motion graphics, photography.
+CGI and AI work, motion graphics, 2D animation and illustration, graphic design,
+photography.
 
 You are looking at {frames} frame(s) from ONE Instagram {kind}, in chronological
 order. They are the same post, not different posts — judge it as a whole.
@@ -128,7 +145,7 @@ Media mode: {mode}.
 
 CORE PRINCIPLE: precision over coverage. A wrong tag is worse than a missing one.
 
-Return five things.
+Return six things.
 
 1. CATEGORY — exactly one of: meme, art, ad, game, other.
    - meme: humour, joke, funny clip, reaction, entertainment
@@ -137,14 +154,22 @@ Return five things.
    - ad: commercial, product promo, branded content
    - game: gameplay, game trailer, game UI, esports
    - other: anything else (talking head, news, cooking, travel vlog, pets, haul)
-   This is a filing decision, separate from the tags below.
+   This is a filing decision, separate from the tags.
 
 2. CONFIDENCE — 0.0 to 1.0 for that category.
 
-3. DESCRIPTION — one paragraph in ENGLISH, under 80 words, written like a
-   director's note. Cover only: the main subject and what it does; the setting;
-   notable lighting (direction and source when both are clear) and colour
-   treatment; the production technique when clearly identifiable.
+3. SUMMARY — ONE sentence in ENGLISH, under 20 words: what this post is as a
+   reference — subject plus genre and technique. Example: "CGI car commercial
+   with neon night lighting and slow orbit shots." No frame-by-frame, no caption retelling.
+
+4. DESCRIPTION — one paragraph in ENGLISH, written like a director's note.
+   Under 80 words for a single-scene post. When the frames show several
+   distinct scenes or sections, cover the WHOLE post in order — what it opens
+   with, what it moves through, how it ends — in up to 130 words, so that
+   nothing shown only in the middle or at the end is lost. For each part:
+   the subject and what it does; the setting; notable lighting (direction and
+   source when both are clear) and colour treatment; the production technique
+   when clearly identifiable.
    - Describe only what you see. Do not infer story, intent or meaning.
    - Do not invent characters, locations or brands. Do not retell the caption.
    - Do not open with "this video shows" / "this image depicts" — describe directly.
@@ -152,31 +177,77 @@ Return five things.
      not "A man walks…".
    - If techniques are mixed (live-action plus a CGI element), name both.
 
-4. ON_SCREEN_TEXT — any readable text burned into the frames: captions,
+5. ON_SCREEN_TEXT — any readable text burned into the frames: captions,
    step titles, software or plugin names, settings, brand names, watermarks.
    Quote it as written, joined with " | ". Empty string if there is none.
    Do not include the Instagram caption here — only text visible in the frames.
 
-5. TAGS — pick ONLY from the lists below, word for word. Anything not in a list
-   is discarded, so inventing tags loses information.
-   - Every tag lowercase, hyphens instead of spaces, no "#".
+6. MEDIUM — the ONE foundation this post is made of: live-action, 3d-render,
+   2d-animation, motion-graphics, stop-motion, screen-recording, illustration,
+   photograph, graphic-design, mixed-media. A still photo is photograph, a
+   drawn or painted still is illustration, CGI of any kind is 3d-render.
+"""
+
+_TAG_RULES = """   - Every tag lowercase, hyphens instead of spaces, no "#".
    - Pick a tag only if a specific frame proves it. Skip a whole category when
      nothing fits — 5 correct tags beat 15 invented ones.
    - Never stack synonyms; pick the single most accurate one.
    - Never guess camera or software brands, production scale, or which AI tool
      was used unless a watermark is visible.
-   - Skip indoor / outdoor / high-contrast / studio unless that IS the defining
-     quality of the shot.
-   - Aim for 8-18 tags; 5-7 is fine for a simple item.
+   - Skip generic tags (high-contrast, studio-lighting, a mood) unless that IS
+     the defining quality of the shot.
+   - Aim for 6-14 tags. For EACH tag give 3-6 words of visual evidence from a
+     specific frame. A tag you cannot back with evidence must be omitted."""
+
+# Перший запит двокрокового режиму: лише опис. Теги — окремим запитом, зі
+# списків, що стосуються саме цього поста (TAG_PROMPT).
+DESCRIBE_PROMPT = _PROMPT_HEAD + """{examples}
+Answer with JSON only, nothing around it:
+{"category": "<meme|art|ad|game|other>", "confidence": <0.0-1.0>,
+ "summary": "<one sentence, under 20 words>",
+ "description": "<one paragraph, English, 80 words; up to 130 for a multi-scene post>",
+ "on_screen_text": "<text visible in frames, or empty string>",
+ "medium": "<live-action|3d-render|2d-animation|motion-graphics|stop-motion|screen-recording|illustration|photograph|graphic-design|mixed-media>",
+ "why": "<max 8 words, English>"}"""
+
+# Один запит, як було до двокрокового режиму: `cfg.vision_two_pass = False` і
+# клієнт.classify. Увесь словник у промпті — ціна цього режиму.
+SINGLE_PASS_PROMPT = _PROMPT_HEAD.replace("six things", "seven things") + """
+7. TAGS — pick ONLY from the lists below, word for word. Anything not in a list
+   is discarded, so inventing tags loses information.
+""" + _TAG_RULES + """
 
 ALLOWED TAGS
 {taxonomy}
 {examples}
 Answer with JSON only, nothing around it:
 {"category": "<meme|art|ad|game|other>", "confidence": <0.0-1.0>,
- "description": "<one paragraph, English, under 80 words>",
+ "summary": "<one sentence, under 20 words>",
+ "description": "<one paragraph, English, 80 words; up to 130 for a multi-scene post>",
  "on_screen_text": "<text visible in frames, or empty string>",
- "tags": ["tag", "tag"], "why": "<max 8 words, English>"}"""
+ "medium": "<live-action|3d-render|2d-animation|motion-graphics|stop-motion|screen-recording|illustration|photograph|graphic-design|mixed-media>",
+ "tags": [{"tag": "<tag>", "evidence": "<3-6 words>"}],
+ "why": "<max 8 words, English>"}"""
+
+# Другий запит: ті самі кадри, але вже з описом і лише з релевантними списками.
+TAG_PROMPT = """You already described this post as: {summary} {description}
+On screen: {ocr}
+
+You are looking at the same {frames} frame(s) of that Instagram {kind}, in
+chronological order. Media mode: {mode}.
+
+Now pick tags ONLY from the lists below, word for word. Anything not in a list
+is discarded, so inventing tags loses information. Precision over coverage.
+""" + _TAG_RULES + """
+
+ALLOWED TAGS
+{taxonomy}
+
+Answer with JSON only, nothing around it:
+{"tags": [{"tag": "<tag>", "evidence": "<3-6 words>"}]}"""
+
+# Стара назва: так інструкцію знає UI («Повернути типову»).
+DEFAULT_PROMPT = DESCRIBE_PROMPT
 
 EXAMPLES_HEADER = (
     "EXAMPLES of descriptions the owner approved — match their register, "
@@ -191,15 +262,26 @@ TUTORIAL_MARKS = ("tut", "tutorial", "howto", "how-to", "lesson", "breakdown",
                   "substance", "zbrush", "maya", "after-effects", "ae ")
 
 
-def prompt_hash(template: str, model: str = "") -> str:
-    """Короткий відбиток інструкції й моделі.
+def prompt_hash(template: str, model: str = "", side: int = 0,
+                two_pass: bool = True) -> str:
+    """Короткий відбиток інструкції, моделі й розміру кадру.
 
     Зберігається поруч з описом: після зміни інструкції інакше не дізнатись,
-    які описи написані старою, а які — новою.
+    які описи написані старою, а які — новою. Сторона кадру — теж частина
+    політики: описи з кадрів по 400 px і по 900 px різної якості, і «лише
+    застарілі» мають уміти їх розрізнити, навіть коли текст інструкції той самий.
+    У двокроковому режимі відбиток рахується від ОБОХ текстів: зміна будь-якого
+    з них робить старі описи застарілими.
     """
-    text = (template or "").strip() or DEFAULT_PROMPT
-    digest = hashlib.sha1((text + "\n" + (model or "")).encode("utf-8")).hexdigest()
-    return digest[:12]
+    text = (template or "").strip()
+    if two_pass:
+        key = (text or DESCRIBE_PROMPT) + "\n--tags--\n" + TAG_PROMPT
+    else:
+        key = text or SINGLE_PASS_PROMPT
+    key += "\n" + (model or "")
+    if side:
+        key += f"\n{int(side)}px"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 
 def render_examples(examples) -> str:
@@ -229,21 +311,40 @@ def collection_hint(collections) -> str:
 
 # Стара однокадрова інструкція лишається під рукою: за нею писані відповіді
 # без опису й тегів, і вона ж — запасний варіант для дуже дрібних моделей.
-PROMPT = DEFAULT_PROMPT
+PROMPT = SINGLE_PASS_PROMPT
 
 
 def build_prompt(template: str, frames: int, kind: str, mode: str = "video",
-                 taxonomy=None, examples=None) -> str:
-    text = (template or "").strip() or DEFAULT_PROMPT
+                 taxonomy=None, examples=None, profiles=None, default=None) -> str:
+    """Інструкція для моделі. Порожній `template` = `default` (типово — повна
+    однозапитна, зі словником); двокроковий режим просить DESCRIBE_PROMPT."""
+    text = (template or "").strip() or (default or SINGLE_PASS_PROMPT)
     if taxonomy is not None and "{taxonomy}" in text:
-        text = text.replace("{taxonomy}", taxonomy.render(mode))
+        text = text.replace("{taxonomy}", taxonomy.render(mode, profiles))
     else:
-        # Своя інструкція без плейсхолдера — теги все одно перевіряються кодом,
-        # просто модель не побачить списків і промахуватиметься частіше.
+        # Без словника (або в інструкції без плейсхолдера) модель списків не
+        # побачить — теги все одно перевіряються кодом.
         text = text.replace("{taxonomy}", "")
     text = text.replace("{examples}", render_examples(examples))
     return (
         text.replace("{frames}", str(max(1, int(frames or 1))))
+        .replace("{kind}", kind or "post")
+        .replace("{mode}", (mode or "video").upper())
+    )
+
+
+def build_tag_prompt(frames: int, kind: str, mode: str, taxonomy, profiles,
+                     summary: str = "", description: str = "", ocr: str = "",
+                     template: Optional[str] = None) -> str:
+    """Другий запит: опис уже є, лишилось обрати теги зі списків цього поста."""
+    text = template or TAG_PROMPT
+    text = text.replace("{taxonomy}",
+                        taxonomy.render(mode, profiles) if taxonomy is not None else "")
+    return (
+        text.replace("{summary}", (summary or "").strip())
+        .replace("{description}", (description or "").strip())
+        .replace("{ocr}", (ocr or "").strip() or "none")
+        .replace("{frames}", str(max(1, int(frames or 1))))
         .replace("{kind}", kind or "post")
         .replace("{mode}", (mode or "video").upper())
     )
@@ -256,6 +357,7 @@ class VisionVerdict:
     why: str = ""
     error: str = ""
     description: str = ""
+    summary: str = ""          # одне речення «що це як референс»
     tags: List[str] = field(default_factory=list)
     frames: int = 0
     on_screen_text: str = ""
@@ -263,6 +365,15 @@ class VisionVerdict:
     # Теги, яких немає у словнику. Не мовчазна втрата, а матеріал для того,
     # щоб словник ріс по реальному контенту.
     dropped: List[str] = field(default_factory=list)
+    # Теги, чий «доказ» модель сама спростувала («no visible sneakers»).
+    rejected: List[str] = field(default_factory=list)
+    # Основа поста за відповіддю моделі (live-action, 3d-render…) і профілі
+    # словника, які з неї вийшли, — для журналу й для тестів.
+    medium: str = ""
+    profiles: tuple = ()
+    # Не помилка, а «частину не вдалось»: опис є, а тегів немає. Викликач
+    # лише логує — вердикт лишається придатним до збереження.
+    warning: str = ""
 
     @property
     def ok(self) -> bool:
@@ -280,7 +391,7 @@ class VisionVerdict:
         і без цієї перевірки порожня відповідь виглядала б як опис.
         """
         real_tags = [t for t in self.tags if t and t != "autotagged"]
-        return bool(self.description or real_tags)
+        return bool(self.description or self.summary or real_tags)
 
     def short_description(self, limit: int = 140) -> str:
         text = " ".join(self.description.split())
@@ -317,6 +428,8 @@ class VisionClient:
         self.taxonomy = taxonomy
         self.ttl = int(ttl or 0)
         self.session = requests.Session()
+        # Знімок /api/v0/models: тип і контекст моделей. None = ще не питали.
+        self._info: Optional[dict] = None
 
     # ------------------------------------------------------------ вивантаження
     def unload(self) -> str:
@@ -362,6 +475,49 @@ class VisionClient:
         items = body.get("data") if isinstance(body, dict) else None
         return [str(item.get("id")) for item in (items or []) if item.get("id")]
 
+    def _model_info(self, refresh: bool = False) -> dict:
+        """Рідний `/api/v0/models` LM Studio: id → {type, loaded_context_length, …}.
+
+        Це єдине джерело, що знає ТИП моделі (vlm / llm / embeddings) і контекст,
+        з яким її справді завантажено. Старіші збірки ендпоінта не мають — тоді
+        порожньо, і далі працюють евристика за назвою та типовий розмір кадру.
+        """
+        if self._info is not None and not refresh:
+            return self._info
+        info: dict = {}
+        try:
+            resp = self.session.get(f"{api_root(self.base_url)}/api/v0/models", timeout=10)
+            resp.raise_for_status()
+            body = resp.json()
+            items = body.get("data") if isinstance(body, dict) else None
+            for item in items or []:
+                if isinstance(item, dict) and item.get("id"):
+                    info[str(item["id"])] = item
+        except (requests.RequestException, ValueError, AttributeError):
+            info = {}
+        self._info = info
+        return info
+
+    def model_types(self, refresh: bool = False) -> dict:
+        """id моделі → тип (`vlm` / `llm` / `embeddings`). Помилка → {}."""
+        return {
+            model_id: str(item.get("type"))
+            for model_id, item in self._model_info(refresh).items()
+            if item.get("type")
+        }
+
+    def model_type(self, model: str = "") -> str:
+        return self.model_types().get((model or self.model or "").strip(), "")
+
+    def context_length(self, model: str = "") -> Optional[int]:
+        """З яким контекстом модель завантажена зараз (токени); невідомо → None."""
+        item = self._model_info().get((model or self.model or "").strip()) or {}
+        try:
+            value = int(item.get("loaded_context_length") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else None
+
     def resolve_model(self) -> str:
         """Якщо модель не вказана — беремо першу завантажену, що виглядає візуальною.
 
@@ -372,28 +528,49 @@ class VisionClient:
         models = self.list_models()
         if not models:
             raise VisionError("У LM Studio не завантажено жодної моделі.")
-        visual = [m for m in models if looks_visual(m)]
+        types = self.model_types()
+        visual = [m for m in models if looks_visual(m, types)]
         self.model = (visual or models)[0]
         return self.model
 
-    # ---------------------------------------------------------- класифікація
-    def classify(self, images: Sequence[bytes], caption: str = "",
-                 username: str = "", kind: str = "post",
-                 mode: str = "", collections=None, examples=None,
-                 transcript: str = "") -> VisionVerdict:
-        """Показує моделі кадри одного поста. Помилки повертає, а не кидає."""
-        shots = [img for img in (images or []) if img][:MAX_FRAMES]
-        if not shots:
-            return VisionVerdict(error="немає зображення")
-        try:
-            model = self.resolve_model()
-        except VisionError as exc:
-            return VisionVerdict(error=str(exc))
+    def warm_up(self, timeout: Optional[float] = None) -> str:
+        """Піднімає модель порожнім текстовим запитом. Повертає її назву.
 
-        mode = mode or ("video" if len(shots) > 1 or kind in ("reel", "video")
-                        else "image")
-        text = build_prompt(self.prompt, len(shots), kind, mode, self.taxonomy,
-                            examples=examples)
+        LM Studio вантажить модель при першому запиті (JIT) — 45–60 с, а то й
+        більше. Якщо це перше завантаження трапляється всередині запиту з
+        кадрами, він упирається в звичайний таймаут, і пост лишається без опису.
+        Тому вантажимо окремо, з щедрим таймаутом, і лише потім шлемо кадри.
+        Невдача — VisionError із причиною: викликач вирішує, що з цим робити.
+        """
+        model = self.resolve_model()
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ok"}],
+        }
+        if self.ttl > 0:
+            payload["ttl"] = int(self.ttl)
+        wait = float(timeout) if timeout else float(max(int(self.timeout or 0), 300))
+        try:
+            resp = self.session.post(
+                f"{self.base_url}/chat/completions", json=payload, timeout=wait)
+        except requests.ConnectionError as exc:
+            raise VisionError("LM Studio не відповідає") from exc
+        except requests.Timeout as exc:
+            raise VisionError(f"модель не завантажилась за {int(wait)} с") from exc
+        except requests.RequestException as exc:
+            raise VisionError(f"LM Studio: {_short(exc)}") from exc
+        if not resp.ok:
+            raise VisionError(f"LM Studio відповів {resp.status_code}: {_error_text(resp)}")
+        # Після завантаження контекст уже відомий — старий знімок його не мав.
+        self._info = None
+        return model
+
+    # ---------------------------------------------------------- класифікація
+    @staticmethod
+    def _context_text(caption: str = "", username: str = "", collections=None,
+                      transcript: str = "") -> str:
         context = []
         if username:
             context.append(f"Account: @{username}")
@@ -406,20 +583,26 @@ class VisionClient:
             context.append(
                 "Voice-over transcript (what the author SAYS; use it to name the "
                 f"technique, do not retell it): {transcript.strip()[:1200]}")
-        if context:
-            text += "\n\n" + "\n".join(context)
+        return "\n".join(context)
 
-        content = [{"type": "text", "text": text}]
-        for shot in shots:
-            content.append({"type": "image_url", "image_url": {
-                "url": "data:image/jpeg;base64," + base64.b64encode(shot).decode()
-            }})
+    def _complete(self, model: str, text: str, shots: Sequence[bytes],
+                  max_tokens: int, images_first: bool = False) -> tuple:
+        """Один запит до моделі. Повертає (відповідь, помилка): рівно одне з двох.
+
+        `images_first`: зображення ПЕРЕД текстом. LM Studio/llama.cpp кешує
+        префікс запиту, тож другий запит двокрокового режиму, що починається з
+        тих самих кадрів, не кодує їх удруге.
+        """
+        pictures = [{"type": "image_url", "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(shot).decode()
+        }} for shot in shots]
+        words = {"type": "text", "text": text}
+        content = pictures + [words] if images_first else [words] + pictures
 
         payload = {
             "model": model,
             "temperature": 0,
-            # опис і теги не влазять у 120 токенів, які вистачало на саму категорію
-            "max_tokens": 600,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": content}],
         }
         if self.ttl > 0:
@@ -428,37 +611,145 @@ class VisionClient:
             # встиг: інакше модель висить у памʼяті до перезапуску LM Studio.
             payload["ttl"] = int(self.ttl)
         try:
+            # Кожен кадр — ще кілька секунд кодування, тож запас росте з кількістю.
             resp = self.session.post(
-                f"{self.base_url}/chat/completions", json=payload, timeout=self.timeout
+                f"{self.base_url}/chat/completions", json=payload,
+                timeout=self.timeout + 2 * len(shots),
             )
             resp.raise_for_status()
             body = resp.json()
         except requests.ConnectionError:
-            return VisionVerdict(error="LM Studio не відповідає")
+            return "", "LM Studio не відповідає"
         except requests.Timeout:
-            return VisionVerdict(error="модель не встигла відповісти")
+            return "", "модель не встигла відповісти"
         except requests.RequestException as exc:
-            return VisionVerdict(error=f"LM Studio: {_short(exc)}")
+            return "", f"LM Studio: {_short(exc)}"
         except ValueError:
-            return VisionVerdict(error="LM Studio повернув не-JSON відповідь")
+            return "", "LM Studio повернув не-JSON відповідь"
 
         try:
-            answer = body["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            return VisionVerdict(error="несподівана відповідь моделі")
+            message = body["choices"][0]["message"]
+            answer = message.get("content")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return "", "несподівана відповідь моделі"
         if isinstance(answer, list):  # деякі збірки віддають список частин
             answer = " ".join(
                 part.get("text", "") for part in answer if isinstance(part, dict)
             )
-        verdict = parse_answer(str(answer))
+        answer, thought = strip_thinking(str(answer or ""))
+        reasoning = message.get("reasoning_content") or message.get("reasoning")
+        if not answer.strip() and (thought or reasoning):
+            # Модель «думала» і вичерпала відповідь на роздуми. Без цього рядка
+            # це виглядало б як «не вдалось розібрати відповідь» — без підказки,
+            # що виправляти треба вибір моделі, а не інструкцію.
+            return "", THINKING_ERROR
+        return answer, ""
+
+    def classify(self, images: Sequence[bytes], caption: str = "",
+                 username: str = "", kind: str = "post",
+                 mode: str = "", collections=None, examples=None,
+                 transcript: str = "") -> VisionVerdict:
+        """Один запит: опис і теги разом. Помилки повертає, а не кидає."""
+        shots = [img for img in (images or []) if img][:MAX_FRAMES]
+        if not shots:
+            return VisionVerdict(error="немає зображення")
+        try:
+            model = self.resolve_model()
+        except VisionError as exc:
+            return VisionVerdict(error=str(exc))
+
+        mode = mode or ("video" if len(shots) > 1 or kind in ("reel", "video")
+                        else "image")
+        text = build_prompt(self.prompt, len(shots), kind, mode, self.taxonomy,
+                            examples=examples)
+        context = self._context_text(caption, username, collections, transcript)
+        if context:
+            text += "\n\n" + context
+
+        # опис і теги з доказами не влазять у 120 токенів, які вистачало на
+        # саму категорію
+        answer, error = self._complete(model, text, shots, 1200)
+        if error:
+            return VisionVerdict(error=error)
+        verdict = parse_answer(answer)
         verdict.frames = len(shots)
         # Користь видно з тексту, а не з кадру: «10 websites for…», «how to…».
         # Модель дивиться на картинку й описує студію — ознаку дає текст.
         verdict.tags = list(verdict.tags) + useful_tags(
-            verdict.on_screen_text, caption, transcript)
+            verdict.on_screen_text, caption, transcript) + software_tags(
+            caption, verdict.on_screen_text, transcript)
         if self.taxonomy is not None:
             # Інструкцію модель порушує, цю перевірку — ні.
             verdict.tags, verdict.dropped = self.taxonomy.normalize(verdict.tags, mode)
+        return verdict
+
+    def describe_then_tag(self, images: Sequence[bytes], caption: str = "",
+                          username: str = "", kind: str = "post",
+                          mode: str = "", collections=None, examples=None,
+                          transcript: str = "") -> VisionVerdict:
+        """Два запити на один файл: спершу опис і medium, потім теги зі списків
+        цього поста.
+
+        Один великий словник на 4B-модель закінчувався загальними словами
+        (`cinematic` у 284 описах із 451), а специфіка не добиралась. Тож другий
+        запит бачить лише профілі, які код вибрав за medium (`profiles_for`).
+        Помилки повертає, а не кидає: впав перший запит — вердикт із помилкою;
+        впав другий — опис лишається, а `warning` каже, чого бракує.
+        """
+        shots = [img for img in (images or []) if img][:MAX_FRAMES]
+        if not shots:
+            return VisionVerdict(error="немає зображення")
+        try:
+            model = self.resolve_model()
+        except VisionError as exc:
+            return VisionVerdict(error=str(exc))
+
+        mode = mode or ("video" if len(shots) > 1 or kind in ("reel", "video")
+                        else "image")
+        text = build_prompt(self.prompt, len(shots), kind, mode, None,
+                            examples=examples, default=DESCRIBE_PROMPT)
+        context = self._context_text(caption, username, collections, transcript)
+        if context:
+            text += "\n\n" + context
+
+        answer, error = self._complete(model, text, shots, 1200, images_first=True)
+        if error:
+            return VisionVerdict(error=error)
+        verdict = parse_answer(answer)
+        verdict.frames = len(shots)
+        if verdict.error and not verdict.has_text:
+            return verdict
+
+        screen = verdict.on_screen_text
+        verdict.profiles = profiles_for(
+            verdict.medium, mode,
+            " ".join(part for part in (verdict.summary, verdict.description, screen) if part))
+
+        tags: List[str] = []
+        rejected = list(verdict.rejected)
+        if self.taxonomy is not None:
+            tag_text = build_tag_prompt(
+                len(shots), kind, mode, self.taxonomy, verdict.profiles,
+                verdict.summary, verdict.description, screen)
+            reply, error = self._complete(model, tag_text, shots, 700, images_first=True)
+            parsed = None if error else parse_tags_answer(reply)
+            if error:
+                verdict.warning = f"теги не отримано: {error}"
+            elif parsed is None:
+                verdict.warning = "теги не отримано: не вдалось розібрати відповідь"
+            else:
+                tags, more = parsed
+                rejected.extend(more)
+        if not tags:
+            # Своя інструкція першого запиту могла сама повернути теги.
+            tags = list(verdict.tags)
+        verdict.rejected = rejected
+        tags = tags + useful_tags(screen, caption, transcript) + software_tags(
+            caption, screen, transcript)
+        if self.taxonomy is not None:
+            verdict.tags, verdict.dropped = self.taxonomy.normalize(tags, mode)
+        else:
+            verdict.tags = tags
         return verdict
 
     def classify_image(self, image: bytes, caption: str = "",
@@ -485,19 +776,26 @@ def parse_answer(text: str) -> VisionVerdict:
     if not isinstance(data, dict):
         return VisionVerdict(error="несподівана відповідь моделі")
 
-    description = _clean_text(data.get("description") or data.get("summary") or "")
-    tags = clean_tags(data.get("tags"))
+    # Стара інструкція (і чужі кастомні) називала описом саме «summary»; тепер це
+    # окреме поле, тож підміняємо лише коли description порожній.
+    summary = _clean_text(data.get("summary") or "")[:300]
+    description = _clean_text(data.get("description") or "")
+    if not description and not data.get("description"):
+        description = _clean_text(data.get("summary") or "")
+    tags, rejected = split_tags(data.get("tags"))
     screen = data.get("on_screen_text") or data.get("screen_text") or ""
     if isinstance(screen, (list, tuple)):
         screen = " | ".join(str(part) for part in screen if str(part).strip())
     screen = _clean_text(screen)[:500]
 
+    medium = _clean_medium(data.get("medium"))
     category = str(data.get("category", "")).strip().lower()
     if category not in CATEGORIES:
         # Опис і теги вже є — віддаємо їх разом із помилкою, вони не винні.
         return VisionVerdict(
             error=f"невідома категорія «{category}»" if category else "модель не назвала категорію",
-            description=description, tags=tags, on_screen_text=screen,
+            description=description, summary=summary, tags=tags,
+            on_screen_text=screen, rejected=rejected, medium=medium,
         )
     try:
         confidence = float(data.get("confidence", 0) or 0)
@@ -508,9 +806,70 @@ def parse_answer(text: str) -> VisionVerdict:
         confidence=max(0.0, min(1.0, confidence)),
         why=str(data.get("why", ""))[:120],
         description=description,
+        summary=summary,
         tags=tags,
         on_screen_text=screen,
+        rejected=rejected,
+        medium=medium,
     )
+
+
+MEDIUMS = ("live-action", "3d-render", "2d-animation", "motion-graphics",
+           "stop-motion", "screen-recording", "illustration", "photograph",
+           "graphic-design", "mixed-media")
+
+
+def _clean_medium(value) -> str:
+    """Основа поста від моделі → одна з MEDIUMS; усе інше — порожньо (невідомо).
+
+    Модель каже «cgi», «3d» чи «photography» — це ті самі синоніми, що й у
+    словнику тегів, тож беремо їхню таблицю, а не ведемо другу.
+    """
+    text = re.sub(r"[\s_]+", "-", str(value or "").strip().lower())
+    text = DEFAULT_ALIASES.get(text, text)
+    return text if text in MEDIUMS else ""
+
+
+def parse_tags_answer(text: str) -> Optional[tuple]:
+    """Відповідь другого запиту → (теги, відхилені за доказом) або None.
+
+    None — відповідь не розібрати; порожній список тегів — це чесне «нічого не
+    підійшло», і це не помилка.
+    """
+    chunk = _first_json_object((text or "").strip())
+    if chunk is None:
+        return None
+    try:
+        data = json.loads(chunk)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return split_tags(data.get("tags"))
+
+
+THINKING_ERROR = (
+    "модель витратила відповідь на роздуми (thinking) і не дійшла до JSON — "
+    "обери instruct-модель без thinking або іншу візуальну модель"
+)
+
+
+def strip_thinking(text: str) -> tuple:
+    """Вирізає блок `<think>…</think>`. Повертає (текст без нього, чи він був).
+
+    Незакритий `<think>` означає, що відповідь обірвалась посеред роздумів — тоді
+    від тексту не лишається нічого. Закриваючий тег без відкриваючого теж
+    трапляється: деякі шаблони самі дописують відкриваючий у промпт.
+    """
+    raw = text or ""
+    had = False
+    if "</think>" in raw:
+        had = True
+        raw = raw.rsplit("</think>", 1)[1]
+    if "<think>" in raw:
+        had = True
+        raw = raw.split("<think>", 1)[0]
+    return raw.strip(), had
 
 
 def _first_json_object(raw: str) -> Optional[str]:
@@ -544,6 +903,41 @@ def _first_json_object(raw: str) -> Optional[str]:
             if depth == 0:
                 return raw[start:index + 1]
     return None
+
+
+def split_tags(value) -> tuple:
+    """Теги від моделі → (прийняті, відхилені за доказом).
+
+    Новий формат — обʼєкти `{"tag", "evidence"}`; старі й чужі інструкції
+    віддають просто рядки, і вони працюють як раніше. Тег, чий доказ містить
+    заперечення («no visible sneakers»), модель сама спростувала — його в
+    результат не пускаємо, а лише повідомляємо викликачеві.
+    """
+    if not isinstance(value, (list, tuple)):
+        return clean_tags(value), []
+    accepted, rejected = [], []
+    for item in value:
+        if isinstance(item, dict):
+            name = item.get("tag") or item.get("name") or ""
+            evidence = str(item.get("evidence") or "")
+            if NEGATIVE_EVIDENCE.search(evidence) and not _negative_by_name(name):
+                rejected.extend(clean_tags([name]))
+                continue
+            accepted.append(name)
+        else:
+            accepted.append(item)
+    return clean_tags(accepted), rejected
+
+
+def _negative_by_name(tag) -> bool:
+    """Тег, що сам означає відсутність чогось: «faceless-shot», «no-dialogue».
+
+    Для нього доказ «no face visible» — підтвердження, а не спростування, і
+    фільтр заперечень його чіпати не має. Інакше `faceless-shot` відкидався
+    саме тоді, коли модель була права.
+    """
+    name = str(tag or "").strip().lower()
+    return "less" in name or name.startswith(("no-", "non-", "without-"))
 
 
 def clean_tags(value) -> List[str]:
@@ -627,6 +1021,19 @@ def slide_urls(media, limit: int = MAX_FRAMES) -> List[str]:
         if cover:
             urls.append(cover)
     return urls
+
+
+def _error_text(resp, limit: int = 160) -> str:
+    """Що LM Studio написала в тілі помилки (там причина зриву завантаження)."""
+    try:
+        body = resp.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        text = error.get("message") if isinstance(error, dict) else error
+        text = str(text or body)
+    except ValueError:
+        text = getattr(resp, "text", "") or ""
+    text = " ".join(str(text).split())
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _short(exc: Exception, limit: int = 90) -> str:

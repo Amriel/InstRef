@@ -36,7 +36,6 @@ from ..state import State
 from ..vision import (
     DEFAULT_PROMPT as VISION_PROMPT,
     MAX_FRAMES as VISION_MAX_FRAMES,
-    SAFE_FRAMES as VISION_SAFE_FRAMES,
 )
 from .pages import DESCRIBE_LABEL, PagesMixin
 from .review_tab import ReviewTab
@@ -688,11 +687,12 @@ class MainWindow(PagesMixin, QMainWindow):
         self.health_worker.done.connect(self._on_health)
         self.health_worker.start()
 
-    def _fill_models(self, models: list) -> None:
+    def _fill_models(self, models: list, types: dict | None = None) -> None:
         """Список моделей LM Studio у випадайку — візуальні першими, текстові з поміткою.
 
         Раніше список зʼявлявся лише після кнопки «Перевірити», і в поле легко
-        потрапляла текстова модель, набрана руками.
+        потрапляла текстова модель, набрана руками. Якщо LM Studio сказала тип
+        моделі, вірімо йому, а не назві.
         """
         from ..vision import looks_visual
 
@@ -700,16 +700,16 @@ class MainWindow(PagesMixin, QMainWindow):
         current = combo.currentText().strip()
         combo.blockSignals(True)
         combo.clear()
-        ordered = sorted(models, key=lambda m: (not looks_visual(m), m.lower()))
+        ordered = sorted(models, key=lambda m: (not looks_visual(m, types), m.lower()))
         for name in ordered:
-            combo.addItem(name if looks_visual(name) else f"{name}   — текстова", name)
+            combo.addItem(name if looks_visual(name, types) else f"{name}   — текстова", name)
         combo.setCurrentText(current)
         combo.blockSignals(False)
         self._models_loaded = bool(models)
 
     def _on_health(self, result: dict) -> None:
         if "models" in result:
-            self._fill_models(result.get("models") or [])
+            self._fill_models(result.get("models") or [], result.get("types") or {})
         ok, text = result.get("eagle", (False, "?"))
         if self.cfg.eagle_enabled:
             self._set_indicator(self.ind_eagle, ok, "Eagle", text if ok else "не відповідає")
@@ -806,14 +806,15 @@ class MainWindow(PagesMixin, QMainWindow):
         self.ck_vision_game.setChecked("game" in skip)
         self.sp_vision_conf.setValue(cfg.vision_min_confidence)
         self.sp_vision_frames.setValue(max(1, min(VISION_MAX_FRAMES, cfg.vision_frames)))
-        self._update_frames_note(self.sp_vision_frames.value())
+        self.sp_vision_side.setValue(max(512, min(1536, int(cfg.vision_frame_side or 896))))
+        self._on_frames_changed()
         self.sp_vision_timeout.setValue(max(10, min(900, cfg.vision_timeout)))
         self.ck_vision_unload.setChecked(cfg.vision_unload_after_run)
         self.sp_vision_ttl.setValue(max(0, min(86400, int(cfg.vision_ttl_seconds or 0))))
         self.ck_vision_describe.setChecked(cfg.vision_describe_downloads)
         self.ck_model_glance.setChecked(cfg.model_needs_glance)
         self.ck_taxonomy.setChecked(cfg.taxonomy_enabled)
-        self.sp_sec_per_frame.setValue(cfg.vision_seconds_per_frame)
+        self.ck_two_pass.setChecked(cfg.vision_two_pass)
         self.ck_by_scene.setChecked(cfg.vision_frames_by_scene)
         self.sp_backlog.setValue(cfg.describe_backlog_per_run)
         index = self.cb_dupe.findData(cfg.dupe_action or "review")
@@ -915,13 +916,14 @@ class MainWindow(PagesMixin, QMainWindow):
             + (["game"] if self.ck_vision_game.isChecked() else [])
         )
         cfg.vision_frames = self.sp_vision_frames.value()
+        cfg.vision_frame_side = self.sp_vision_side.value()
         cfg.vision_timeout = self.sp_vision_timeout.value()
         cfg.vision_unload_after_run = self.ck_vision_unload.isChecked()
         cfg.vision_ttl_seconds = self.sp_vision_ttl.value()
         cfg.vision_describe_downloads = self.ck_vision_describe.isChecked()
         cfg.model_needs_glance = self.ck_model_glance.isChecked()
         cfg.taxonomy_enabled = self.ck_taxonomy.isChecked()
-        cfg.vision_seconds_per_frame = self.sp_sec_per_frame.value()
+        cfg.vision_two_pass = self.ck_two_pass.isChecked()
         cfg.vision_frames_by_scene = self.ck_by_scene.isChecked()
         cfg.describe_backlog_per_run = self.sp_backlog.value()
         cfg.dupe_action = str(self.cb_dupe.currentData() or "review")
@@ -1067,8 +1069,9 @@ class MainWindow(PagesMixin, QMainWindow):
         from ..vision import VisionClient, VisionError
 
         url = self.ed_vision_url.text().strip() or "http://localhost:1234/v1"
+        client = VisionClient(url)
         try:
-            models = VisionClient(url).list_models()
+            models = client.list_models()
         except VisionError as exc:
             self.lbl_vision.setText(
                 f"{exc} Перевір, що в LM Studio запущений сервер "
@@ -1080,16 +1083,24 @@ class MainWindow(PagesMixin, QMainWindow):
 
         from ..vision import looks_visual
 
-        self._fill_models(models)
+        types = client.model_types()
+        self._fill_models(models, types)
         chosen = self.cb_vision_model.currentText().strip()
         if not chosen and models:
-            chosen = next((m for m in models if looks_visual(m)), "")
+            chosen = next((m for m in models if looks_visual(m, types)), "")
             self.cb_vision_model.setCurrentText(chosen)
+        # Підказка про тип — з рідного /api/v0/models: це відповідь самої LM Studio,
+        # а не здогад за назвою.
+        kind = types.get(chosen)
+        type_note = ""
+        if kind:
+            type_note = " · тип: " + ("візуальна" if kind == "vlm"
+                                      else "текстова — кадрів не побачить")
         if not models:
             self.lbl_vision.setText("Сервер відповідає, але жодної моделі не завантажено.")
             self.lbl_vision.setProperty("role", "warn")
-        elif chosen and not looks_visual(chosen):
-            visual = [m for m in models if looks_visual(m)]
+        elif chosen and not looks_visual(chosen, types):
+            visual = [m for m in models if looks_visual(m, types)]
             self.lbl_vision.setText(
                 f"«{chosen}» — текстова модель: кадрів вона не побачить, описів не буде. "
                 + (f"Візуальні серед завантажених: {', '.join(visual)}." if visual
@@ -1099,36 +1110,36 @@ class MainWindow(PagesMixin, QMainWindow):
         else:
             self.lbl_vision.setText(
                 f"LM Studio на звʼязку · завантажено моделей: {len(models)}"
-                + (f" · обрано {chosen}" if chosen else " · буде взята перша візуальна") + "."
+                + (f" · обрано {chosen}" if chosen else " · буде взята перша візуальна")
+                + type_note + "."
             )
             self.lbl_vision.setProperty("role", "ok")
             if not self.ck_vision.isChecked():
                 self.ck_vision.setChecked(True)
         self._restyle(self.lbl_vision)
 
-    def _update_frames_note(self, count: int) -> None:
-        """Чесно каже, чим доведеться заплатити за багато кадрів.
+    def _on_frames_changed(self, *_args) -> None:
+        self._update_frames_note(self.sp_vision_frames.value(), self.sp_vision_side.value())
 
-        Стеля висока навмисно, але кожен кадр — це сотні токенів контексту й
-        зайві секунди. Мовчазний спінбокс до 60 виглядав би як обіцянка, що
-        так робити нормально.
+    def _update_frames_note(self, count: int, side: int) -> None:
+        """Чесно каже, скільки токенів контексту з'їдять кадри.
+
+        Нижче ~1000 токенів на зображення Qwen-VL лише перераховує кадри, а не
+        читає їх, тому важить розмір, а не кількість. Зате загальна вага ролика
+        мусить вміститись у контекст моделі — про це й попереджаємо.
         """
-        from ..frames import side_for
+        from ..describe import tokens_per_frame
 
-        if count <= 1:
-            text, role = ("Модель бачитиме лише обкладинку — як до появи кадрів.", "")
-        elif count <= VISION_SAFE_FRAMES:
-            text, role = (f"Кадри по {side_for(count)} px. Робочий діапазон.", "ok")
-        else:
-            text, role = (
-                f"Кадри здрібнюються до {side_for(count)} px, щоб запит не розпух. "
-                f"Понад {VISION_SAFE_FRAMES} кадрів вистачає контексту не кожній "
-                "моделі: якщо відповіді почнуть ламатись або довго не приходити — "
-                "зменш або підніми таймаут нижче.",
-                "warn",
-            )
+        per = tokens_per_frame(side)
+        total = per * max(1, count)
+        text = f"≈ {per} токенів на кадр, до {total} на ролик."
+        role = "ok"
+        if total > 20000:
+            text += (" Це більше, ніж вміщає контекст більшості моделей: зменш "
+                     "кількість або сторону, інакше запит обірветься.")
+            role = "warn"
         self.lbl_frames.setText(text)
-        self.lbl_frames.setProperty("role", role or "hint")
+        self.lbl_frames.setProperty("role", role)
         self._restyle(self.lbl_frames)
 
     def on_tag_suggestions(self) -> None:

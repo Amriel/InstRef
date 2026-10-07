@@ -239,6 +239,13 @@ class ReviewCard(QFrame):
         # Опис і теги моделі — тут, де видно помилку, їх і правлять. У Eagle
         # піде вже виправлене: імпорт читає ai_meta у момент «Залишити».
         meta = (state.ai_meta(self.media_pk, self._idx) if state else None) or {}
+        # Підсумок лише для читання: це одне речення, яке модель пише поруч
+        # з описом; правити тут є що — опис.
+        self.lbl_summary = QLabel(meta.get("summary", ""))
+        self.lbl_summary.setWordWrap(True)
+        self.lbl_summary.setStyleSheet("font-style: italic;")
+        self.lbl_summary.setVisible(bool(meta.get("summary")))
+        layout.addWidget(self.lbl_summary)
         self.ed_description = QPlainTextEdit()
         self.ed_description.setPlaceholderText("опис від моделі — можна правити")
         self.ed_description.setPlainText(meta.get("description", ""))

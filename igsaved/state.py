@@ -151,6 +151,7 @@ def _ai_row(row) -> dict:
         "prompt_hash": (row["prompt_hash"] or "") if "prompt_hash" in row.keys() else "",
         "screen_text": (row["screen_text"] or "") if "screen_text" in row.keys() else "",
         "transcript": (row["transcript"] or "") if "transcript" in row.keys() else "",
+        "summary": (row["summary"] or "") if "summary" in row.keys() else "",
     }
 
 
@@ -182,6 +183,7 @@ class State:
         ("ai_meta", "prompt_hash", "TEXT"),
         ("ai_meta", "screen_text", "TEXT"),
         ("ai_meta", "transcript", "TEXT"),
+        ("ai_meta", "summary", "TEXT"),
         ("eagle_items", "item_id", "TEXT"),
     )
 
@@ -592,7 +594,8 @@ class State:
     def set_ai_meta(self, media_pk: str, category: str, confidence: float,
                     description: str, tags: Iterable[str], model: str = "",
                     frames: int = 0, idx: int = 0, prompt_hash: str = "",
-                    screen_text: str = "", transcript: str = "") -> None:
+                    screen_text: str = "", transcript: str = "",
+                    summary: str = "") -> None:
         """Те, що модель написала про пост. Живе окремо від media, бо
         зʼявляється ще до того, як пост вирішено качати.
 
@@ -602,11 +605,11 @@ class State:
             self.db.execute(
                 "INSERT OR REPLACE INTO ai_meta (media_pk, idx, category, confidence,"
                 " description, tags, model, frames, created_at, prompt_hash, screen_text,"
-                " transcript) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                " transcript, summary) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(media_pk), int(idx or 0), category or "", float(confidence or 0.0),
                  description or "", "\n".join(str(t) for t in (tags or []) if t),
                  model or "", int(frames or 0), _now(), prompt_hash or "",
-                 screen_text or "", transcript or ""),
+                 screen_text or "", transcript or "", summary or ""),
             )
             self.db.commit()
 
@@ -635,6 +638,35 @@ class State:
                 (str(media_pk), int(idx or 0)),
             ).fetchone()
         return row is not None
+
+    def undescribed_files(self, limit: int = 0) -> list:
+        """Файли готових постів, що лишились без опису: [(pk, шлях, idx)].
+
+        Невдалий опис (LM Studio не піднялась, таймаут при JIT-завантаженні)
+        не повторювався: пост ішов далі без нотатки й ніким не згадувався. Тепер
+        його видно просто за базою: готовий пост, файл на диску, а запису з
+        непорожнім описом під тим самим (pk, idx) немає. Найновіші першими —
+        їх власник побачить у Eagle раніше. Файл, якого вже нема на диску
+        (чистка перевалки), в чергу не потрапляє. limit=0 — без обмеження.
+        """
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT f.media_pk AS pk, f.path AS path, f.idx AS idx"
+                " FROM files f JOIN media m ON m.pk = f.media_pk"
+                " WHERE f.kind IN ('video', 'photo') AND m.status = 'done'"
+                " AND NOT EXISTS (SELECT 1 FROM ai_meta a WHERE a.media_pk = f.media_pk"
+                "   AND a.idx = COALESCE(f.idx, 0) AND COALESCE(a.description, '') <> '')"
+                " ORDER BY COALESCE(m.downloaded_at, m.first_seen, '') DESC,"
+                " f.media_pk, COALESCE(f.idx, 0)"
+            ).fetchall()
+        result = []
+        for row in rows:
+            if not Path(row["path"]).exists():
+                continue
+            result.append((str(row["pk"]), str(row["path"]), int(row["idx"] or 0)))
+            if limit and len(result) >= limit:
+                break
+        return result
 
     def all_ai_meta(self) -> dict:
         """Одним запитом — щоб дозалив у Eagle не бив базу по посту.

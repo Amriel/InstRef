@@ -364,22 +364,21 @@ class PagesMixin:
         self.sp_vision_frames.setRange(1, VISION_MAX_FRAMES)
         self.sp_vision_frames.setSuffix(" кадр(ів)")
         self.sp_vision_frames.setFixedWidth(185)
-        self.sp_vision_frames.valueChanged.connect(self._update_frames_note)
-        form.addRow(_flabel("Мінімум на відео"), _row(_left(self.sp_vision_frames)))
+        self.sp_vision_frames.valueChanged.connect(self._on_frames_changed)
+        form.addRow(_flabel("Не більше кадрів на відео"), _row(_left(self.sp_vision_frames)))
+        form.addRow(_flabel(""), _hint(
+            "Скільки взяти, вирішує тривалість: до 10 с — 4 кадри, до 30 с — 8, "
+            "довше — 12. Це число лише стеля. Картинка й слайд карусель — по одному кадру."))
+
+        self.sp_vision_side = QSpinBox()
+        self.sp_vision_side.setRange(512, 1536)
+        self.sp_vision_side.setSingleStep(128)
+        self.sp_vision_side.setSuffix(" px")
+        self.sp_vision_side.setFixedWidth(185)
+        self.sp_vision_side.valueChanged.connect(self._on_frames_changed)
+        form.addRow(_flabel("Сторона кадру"), _row(_left(self.sp_vision_side)))
         self.lbl_frames = _hint("")
         form.addRow(_flabel(""), self.lbl_frames)
-
-        self.sp_sec_per_frame = QDoubleSpinBox()
-        self.sp_sec_per_frame.setRange(0.0, 60.0)
-        self.sp_sec_per_frame.setDecimals(0)
-        self.sp_sec_per_frame.setSuffix(" с на кадр")
-        self.sp_sec_per_frame.setSpecialValueText("завжди стільки, як вище")
-        self.sp_sec_per_frame.setFixedWidth(185)
-        form.addRow(_flabel("Кадрів від тривалості"), _row(_left(self.sp_sec_per_frame)))
-        form.addRow(_flabel(""), _hint(
-            "Приблизно один кадр на стільки секунд ролика — не менше мінімуму і не "
-            f"більше стелі {VISION_MAX_FRAMES}. Десятисекундний reel і трихвилинний "
-            "туторіал не заслуговують однакової кількості кадрів."))
 
         self.ck_by_scene = QCheckBox("Брати кадри за зміною сцени, минаючи чорні")
         self.ck_by_scene.setToolTip(
@@ -434,13 +433,23 @@ class PagesMixin:
         prompt_head.addWidget(self.btn_prompt_reset)
         form.addRow(_row(prompt_head))
 
+        self.ck_two_pass = QCheckBox("Теги окремим запитом за профілем поста")
+        self.ck_two_pass.setToolTip(
+            "Перший запит — опис і основа поста (live-action, 3d-render, 2d-animation…),\n"
+            "другий — теги лише зі списків, що стосуються цього поста. Дає менше загальних\n"
+            "слів і більше специфіки, але це вдвічі більше запитів до моделі.\n"
+            "Без галочки — один запит із усім словником, як було раніше.\n"
+            "Власна інструкція нижче замінює лише перший запит.")
+        form.addRow(self.ck_two_pass)
+
         self.ed_vision_prompt = QPlainTextEdit()
         self.ed_vision_prompt.setMinimumHeight(360)
         self.ed_vision_prompt.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         form.addRow(self.ed_vision_prompt)
         form.addRow(_hint(
-            "Відповідь має лишатись JSON із полями category, confidence, description, "
-            "on_screen_text і tags. "
+            "Відповідь має лишатись JSON із полями category, confidence, summary, "
+            "description, on_screen_text і medium (теги — окремим запитом; у режимі "
+            "одного запиту ще й tags). "
             + " ".join(f"{token} — {what}." for token, what in VISION_PLACEHOLDERS.items())
             + " Поки інструкцію не змінено, вона оновлюється разом із застосунком."))
         return box

@@ -37,7 +37,7 @@ ever downloaded twice. The download folder is a staging area, not an archive.
 **Describes what it sees.** A vision model in [LM Studio](https://lmstudio.ai/)
 looks at frames sampled across the whole clip — not the cover, which for reels
 is usually a black frame — and writes an English one-paragraph description plus
-tags drawn from a fixed vocabulary of ~370 terms across 29 categories.
+tags drawn from a fixed vocabulary of ~430 terms across 37 groups.
 
 **Filters your likes.** Saves are yours and get downloaded as-is. Likes are
 noisier, so rules plus the model sort memes from references. Anything either is
@@ -119,12 +119,23 @@ The model receives frames from across the clip rather than the cover image —
 judging a reel by its first frame was the single largest source of
 misclassification. Frames are picked **by scene cut**, not at even intervals:
 a fast-cut reel sampled evenly lands on transitions and black frames. How many
-depends on length — roughly one per five seconds, between 6 and 60. Carousels
-are described slide by slide, because slides are different pictures and one
-shared description would be a lie about each of them.
+depends on length: 4 for a clip up to ten seconds, 8 up to thirty, 12 up to a
+minute, 20 up to two minutes, 32 beyond (the ceiling is a setting; 32 is the
+maximum). For a multi-scene post the description covers the whole clip in
+order — opening, middle, ending — not just the dominant scene. Frames are kept
+**large** — 896 px by default — because a vision model reads a few big frames
+far better than many small ones: a frame shrunk to 448 px is worth about a
+hundred image tokens, and Qwen-VL itself asks for at least a thousand per
+picture. Carousels are described slide by slide, because slides are different
+pictures and one shared description would be a lie about each of them.
 
-It returns four things: a filing category, an English description written like
-a director's note, any **text visible on screen** (step titles, plugin names —
+Every tag the model proposes must cite what it saw ("green jacket, ski
+goggles"). A tag it cannot back up — the model will happily write "sneaker (no
+visible sneakers)" — is dropped before it reaches Eagle.
+
+It returns five things: a filing category, a one-sentence summary (what the
+post is as a reference), an English description written like a director's
+note, any **text visible on screen** (step titles, plugin names —
 what tutorials are actually searched by), and tags. Posts saved in a collection
 named like a tutorial get a hint to describe the technique, not the picture.
 When a run ends, InstRef asks LM Studio to unload the model, so a few
@@ -144,9 +155,18 @@ next to the pretty footage.
 **Tags come from a controlled vocabulary.** `3d-render`, `3drender`, `render`
 and `3d` are four different tags to Eagle and none of them finds the others —
 which is how reference libraries stop being searchable. So the model picks from
-fixed lists covering lighting, colour, framing, camera angle, lens, movement,
-editing, composition, medium, technique, subject, materials, environment and
-mood.
+fixed lists, organised by **profile**. A core set always applies: light, colour,
+dominant hue, framing, angle, composition, mood, genre, subject, people, and
+"what this is a reference for". Film language — camera moves, editing and
+transitions, lens, grade, location, time and weather, vehicles, products —
+applies to live footage; materials, 3D technique and 3D design to renders; 2D
+style and 2D design to animation and illustration; motion design and graphic
+design to their own. Tagging is a second step: the model first describes the
+post and names its medium, then is asked for tags from the matching profiles
+only, each with a few words of evidence from a specific frame. A tag the model
+cannot back up is dropped. Software (`blender`, `cinema-4d`, `redshift`,
+`comfyui`…) comes from the caption, hashtags and on-screen text by rule, never
+from guessing at frames.
 
 Asking a model to follow a list is not enough; it will improvise anyway. So the
 vocabulary is **enforced in code** after the answer: unknown tags are dropped,

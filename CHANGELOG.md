@@ -4,6 +4,68 @@ Human-readable notes for each release. The release workflow copies the section
 for the tagged version into the GitHub release, and the app shows it under
 *About → Update*. Newest first.
 
+## 2.6.0
+
+- **Descriptions are written from a few large frames instead of dozens of tiny
+  ones.** Until now a 60-second reel could go to the model as 60 frames shrunk
+  to 384 px — about a hundred image tokens each, roughly a tenth of what
+  Qwen-VL is built to read per picture. The model answered with frame-by-frame
+  lists ("later frames show…") and tags that were not in the clip (`talking-head`
+  on a mountain landscape, `sneaker` where there were no shoes). Now every frame
+  is 896 px by default, and the count follows the length: 4 for a clip up to
+  ten seconds, 8 up to thirty, 12 up to a minute, 20 up to two, 32 beyond. For
+  a multi-scene post the model is asked to cover the whole clip in order — what
+  it opens with, what it moves through, how it ends — instead of the dominant
+  scene only. Settings
+  above the new ceiling are lowered when the app starts (and written back the
+  next time settings are saved); the log says so. To redo
+  the descriptions written the old way, open *Eagle → Library → Describe the
+  library* and choose *Rewrite stale*.
+- **A one-line summary above the description.** The model now also writes one
+  sentence — subject, genre, technique — which opens the Eagle note ("In
+  short: …") and the file comment. The long description covers the clip scene
+  by scene; the summary is what you skim.
+- **Fixed: CGI and 3D stills never got a medium tag.** `cgi`, `ai-generated`
+  and `mixed-media` live in both the video and the image list, but the
+  vocabulary index only remembered the video one, so on photos and carousel
+  slides they were thrown away as unknown; `3d-render` was folded into a
+  video-only tag. 97 discarded `cgi` proposals in the vocabulary report were
+  this bug, not the model.
+- **A new vocabulary, and tags chosen in a second step.** The old list had 378
+  tags, 171 of which were never used once, no words for 2D or graphic design,
+  and `cinematic` on two posts out of three. The vocabulary is now 432 tags in
+  37 groups, organised by profile: a core set (light, colour, dominant hue,
+  framing, mood, genre, subject, people, what the post is a reference for)
+  always applies; film language (camera moves, editing and transitions, lens,
+  grade, location, time and weather, vehicles, products) applies to live
+  footage; materials, 3D technique and 3D design to renders; 2D style and 2D
+  design to animation and illustration; motion design and graphic design to
+  their own. The model first describes the post and names its medium; the app
+  then asks it for tags from the matching profiles only — so a fashion film
+  gets `steadicam` and `film-emulation`, a render gets `subsurface-skin` and
+  `fluid-simulation`, and neither sees the other's list. Software (`blender`,
+  `cinema-4d`, `redshift`, `comfyui`…) is taken from the caption, hashtags and
+  on-screen text by rules, never guessed from the frames. Tags with no evidence
+  in the vocabulary report (`ad`, `cinematic`) are ignored instead of counted.
+  A `taxonomy.json` saved before this version is set aside as
+  `taxonomy.pre-profiles.json` the first time the vocabulary dialog is opened.
+- **Every tag must cite its evidence.** The model now names what it saw for each
+  tag; a tag it cannot back up (it literally writes "no visible sneakers") is
+  dropped before it reaches Eagle. Decision categories (`ad`, `art`…) no longer
+  pollute the vocabulary suggestions.
+- **A failed description is retried next run.** Previously, if LM Studio was
+  still loading, timed out, or was simply closed, the post was filed as done and
+  went to Eagle without a note — and only the slow library pass (10 per run)
+  could catch up. The run now warms the model up first and says plainly when it
+  cannot; posts that still lack a description are described from the files on
+  disk at the start of the next run, and their Eagle items are updated.
+- **Thinking models are recognised.** A model that spends its whole answer on
+  reasoning and never produces the JSON is reported as such instead of as an
+  unparseable reply. Whether a model is visual or text-only is now read from LM
+  Studio, not guessed from its name.
+- Settings → Model → Frames: "frames per video" is now a ceiling (1–32), and
+  there is a new "frame side" field; "seconds per frame" is gone.
+
 ## 2.5.5
 
 - **Describe the whole Eagle library, not only the app's own folder.** Until now

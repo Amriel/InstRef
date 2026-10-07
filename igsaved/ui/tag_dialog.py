@@ -118,7 +118,7 @@ class TagSuggestionsDialog(QDialog):
         count.setFixedWidth(48)
 
         picker = QComboBox()
-        for key, title in self.taxonomy.category_titles():
+        for key, title in self.taxonomy.category_labels():
             picker.addItem(title.title(), key)
         picker.setMinimumWidth(190)
 
